@@ -1,7 +1,6 @@
 import { Telegraf } from 'telegraf';
-import { Keypair, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { Keypair } from '@solana/web3.js';
 import { SolanaProvider } from './chains/SolanaProvider';
-import { prisma } from './services/PrismaClient';
 import { PumpFunStrategy } from './trading/strategies/solana/PumpFunStrategy';
 import { JupiterStrategy } from './trading/strategies/solana/JupiterStrategy';
 import { TradeRouter } from './trading/router/TradeRouter';
@@ -13,13 +12,6 @@ import { TradingPanel } from './panels/TradingPanel';
 import { PumpFunLimitOrderManager } from './trading/managers/PumpFunLimitOrderManager';
 import { JupiterLimitOrderManager } from './trading/managers/JupiterLimitOrderManager';
 import { PriceMonitor } from './trading/managers/PriceMonitor';
-import { StateManager } from './services/StateManager';
-import { TokenDataFetcher } from './services/TokenDataFetcher';
-import { PositionTracker } from './services/PositionTracker';
-import { TPSLManager } from './services/TPSLManager';
-import { AutoRefreshService } from './services/AutoRefreshService';
-import { extractSolanaAddress } from './utils/SolanaAddressValidator';
-import { PanelMode } from './types/panel';
 import dotenv from 'dotenv';
 import bs58 from 'bs58';
 
@@ -43,13 +35,6 @@ let tradingPanel: TradingPanel | null = null;
 let priceMonitor: PriceMonitor | null = null;
 let pumpFunLimitOrderManager: PumpFunLimitOrderManager | null = null;
 let jupiterLimitOrderManager: JupiterLimitOrderManager | null = null;
-
-// Новые сервисы для торговой панели
-let stateManager: StateManager | null = null;
-let tokenDataFetcher: TokenDataFetcher | null = null;
-let positionTracker: PositionTracker | null = null;
-let tpslManager: TPSLManager | null = null;
-let autoRefreshService: AutoRefreshService | null = null;
 
 let userSettings: UserSettings = {
   slippage: 1.0,
@@ -76,9 +61,7 @@ bot.action('trade_panel', async (ctx) => {
   console.log('📊 Opening trading panel...');
   await ctx.answerCbQuery();
   if (tradingPanel) {
-    await ctx.reply('📊 **Торговая панель**\n\nОтправьте адрес токена для открытия панели.', {
-      parse_mode: 'Markdown',
-    });
+    await tradingPanel.showMainMenu(ctx);
   } else {
     await ctx.reply('⏳ Торговая панель недоступна. Убедитесь, что кошелек загружен.');
   }
@@ -112,11 +95,35 @@ bot.on('callback_query', async (ctx) => {
   }
 });
 
+// Обработка callback queries для кнопок "Купить" и "Продать"
+bot.action('buy_token', async (ctx) => {
+  console.log('🛒 Buy token button pressed');
+  await ctx.answerCbQuery();
+  if (tradingPanel) {
+    await tradingPanel.showMainMenu(ctx);
+  }
+});
+
+bot.action('sell_token', async (ctx) => {
+  console.log('📈 Sell token button pressed');
+  await ctx.answerCbQuery();
+  if (tradingPanel) {
+    await tradingPanel.showMainMenu(ctx);
+  }
+});
+
+bot.action('get_quote', async (ctx) => {
+  console.log('💹 Get quote button pressed');
+  await ctx.answerCbQuery();
+  if (tradingPanel) {
+    await tradingPanel.showMainMenu(ctx);
+  }
+});
+
 bot.start(async (ctx) => {
   await ctx.reply(
     '👋 Добро пожаловать!\n\n' +
     '📊 **Торговля:**\n' +
-    'Отправьте адрес токена для открытия торговой панели\n' +
     '/trade - панель управления торговлей (кнопки)\n' +
     '/buy [token] [amount] - купить токен\n' +
     '/sell [token] [amount] - продать токен\n' +
@@ -135,7 +142,6 @@ bot.help((ctx) => {
   ctx.reply(
     '📋 **Список команд:**\n\n' +
     '📈 **Торговля:**\n' +
-    '📤 Отправьте адрес токена для открытия торговой панели\n' +
     '/trade - 📊 Панель управления торговлей (рекомендуется)\n' +
     '/buy [mint] [SOL_amount] - Купить токен за SOL\n' +
     '/sell [mint] [token_amount] - Продать токен за SOL\n' +
@@ -158,9 +164,7 @@ bot.command('trade', async (ctx) => {
   if (!tradingPanel) {
     return ctx.reply('⏳ Торговый модуль не готов. Убедитесь, что кошелек загружен.');
   }
-  await ctx.reply('📊 **Торговая панель**\n\nОтправьте адрес токена для открытия панели.', {
-    parse_mode: 'Markdown',
-  });
+  await tradingPanel.showMainMenu(ctx);
 });
 
 bot.command('balance', async (ctx) => {
@@ -321,137 +325,27 @@ bot.command('export_private_key', async (ctx) => {
     }
 });
 
-// Обработка текстовых сообщений (автоматическое открытие панели по адресу токена)
+// Обработка текстовых сообщений (для создания ордеров)
 bot.on('text', async (ctx, next) => {
   console.log('💬 Received text message:', ctx.message?.text);
   try {
-    const text = ctx.message?.text;
-    if (!text) {
-      next();
+    if (tradingPanel && await tradingPanel.handleUserInput(ctx)) {
+      // Сообщение было обработано TradingPanel
+      console.log('✅ Message handled by trading panel');
       return;
     }
-
-    const userId = ctx.from?.id;
-    if (!userId) {
-      next();
-      return;
-    }
-
-    // Сначала проверяем, ожидается ли ввод от пользователя
-    if (stateManager && tradingPanel) {
-      const state = await stateManager.getState(userId);
-      if (state && state.waiting_for) {
-        const handled = await tradingPanel.handleTextInput(ctx);
-        if (handled) {
-          console.log('✅ Message handled by trading panel (waiting for input)');
-          return;
-        }
-      }
-    }
-
-    // Проверяем, является ли текст адресом токена
-    const tokenAddress = extractSolanaAddress(text);
-    if (!tokenAddress) {
-      console.log('ℹ️ Message is not a token address');
-      next();
-      return;
-    }
-
-    // Проверяем, инициализированы ли сервисы
-    if (!stateManager || !tokenDataFetcher || !tradingPanel) {
-      await ctx.reply('⏳ Торговая панель инициализируется. Попробуйте снова через несколько секунд.');
-      next();
-      return;
-    }
-
-    try {
-      // Показать индикатор загрузки
-      const loadingMsg = await ctx.reply('⏳ Загрузка данных токена...');
-
-      // Загрузить данные токена
-      const tokenData = await tokenDataFetcher.fetchTokenData(tokenAddress);
-      if (!tokenData) {
-        await ctx.telegram.editMessageText(loadingMsg.chat.id, loadingMsg.message_id, undefined, '❌ Токен не найден или некорректный адрес');
-        return;
-      }
-
-      // Получить баланс пользователя
-      const wallet = await walletManager.getWallet();
-      if (!wallet) {
-        await ctx.telegram.editMessageText(loadingMsg.chat.id, loadingMsg.message_id, undefined, '❌ Кошелек не найден. Создайте или импортируйте его через /wallet.');
-        return;
-      }
-
-      const solBalance = await solanaProvider.getBalance(wallet.publicKey.toString());
-      const solBalanceSOL = solBalance / LAMPORTS_PER_SOL;
-      const usdBalance = solBalanceSOL * 150; // Примерная цена SOL в USD
-
-      // Создать состояние пользователя
-      const userState = {
-        user_id: userId,
-        message_id: loadingMsg.message_id,
-        token_address: tokenAddress,
-        mode: PanelMode.BUY,
-        token_data: tokenData,
-        user_data: {
-          sol_balance: solBalanceSOL,
-          usd_balance: usdBalance,
-          has_active_order: false,
-        },
-        action_data: {
-          selected_amount: 50,
-          slippage: userSettings.slippage,
-          tp_enabled: false,
-          sl_enabled: false,
-        },
-        created_at: Date.now(),
-        closed: false,
-      };
-
-      stateManager.setState(userId, userState);
-
-      // Заменить сообщение на панель
-      await ctx.telegram.editMessageText(
-        loadingMsg.chat.id,
-        loadingMsg.message_id,
-        undefined,
-        tradingPanel.generatePanelText(userState),
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: tradingPanel.generateKeyboard(userState),
-          },
-        }
-      );
-
-      // Запустить авто-обновление
-      if (autoRefreshService) {
-        autoRefreshService.startAutoRefresh(userId);
-      }
-
-      console.log(`✅ Trading panel opened for token ${tokenAddress}`);
-    } catch (error) {
-      console.error('Error loading token:', error);
-      await ctx.reply('❌ Ошибка загрузки токена. Попробуйте снова.');
-      next();
-    }
+    console.log('ℹ️ Message not handled by trading panel');
+    // Передаем управление следующему обработчику
+    next();
   } catch (error) {
     console.error('❌ Error in text handler:', error);
+    // Передаем управление следующему обработчику даже при ошибке
     next();
   }
 });
 
 async function main() {
   try {
-    console.log('🗄️ Connecting to database...');
-    await Promise.race([
-      prisma.$connect(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Database connection timeout (10s)')), 10000)
-      )
-    ]);
-    console.log('✅ Database connected');
-    
     console.log('🚀 Starting bot initialization...');
     console.log('📡 Connecting to Solana provider...');
     await solanaProvider.connect();
@@ -508,51 +402,18 @@ async function main() {
       await jupiterLimitOrderManager.monitorOrders();
       console.log('✅ Jupiter limit order manager initialized and monitoring started.');
       
-      // Initialize new services for trading panel
-      console.log('🗄️ Initializing StateManager...');
-      stateManager = new StateManager();
-      console.log('✅ StateManager initialized.');
-
-      console.log('📊 Initializing TokenDataFetcher...');
-      tokenDataFetcher = new TokenDataFetcher(solanaProvider.connection);
-      console.log('✅ TokenDataFetcher initialized.');
-
-      console.log('📈 Initializing PositionTracker...');
-      positionTracker = new PositionTracker();
-      console.log('✅ PositionTracker initialized.');
-
-      console.log('🎯 Initializing TPSLManager...');
-      tpslManager = new TPSLManager(pumpFunLimitOrderManager);
-      console.log('✅ TPSLManager initialized.');
-
-      // Initialize TradingPanel without autoRefreshService first (to avoid circular dependency)
+      // Initialize TradingPanel (используем PumpFun менеджер по умолчанию)
       console.log('🎨 Initializing trading panel...');
       tradingPanel = new TradingPanel(
         bot,
         tradeRouter,
         pumpFunLimitOrderManager,
         walletManager,
-        userSettings,
-        stateManager,
-        tokenDataFetcher,
-        positionTracker,
-        tpslManager,
-        null // autoRefreshService will be set later
+        userSettings
       );
       console.log('✅ Trading panel initialized.');
-
-      console.log('🔄 Initializing AutoRefreshService...');
-      autoRefreshService = new AutoRefreshService(bot, stateManager!, tokenDataFetcher, tradingPanel);
-      console.log('✅ AutoRefreshService initialized.');
       
-      // Set autoRefreshService in TradingPanel via setter
-      tradingPanel.setAutoRefreshService(autoRefreshService);
-      console.log('✅ AutoRefreshService linked to TradingPanel.');
-      
-      // Restore all active panels from database
-      console.log('🔁 Restoring active panels...');
-      await autoRefreshService.restoreAllPanels();
-      console.log('✅ Active panels restored.');
+      console.log('✅ Trading panel initialized.');
       
     } else {
       console.warn('⚠️ Wallet not found. Trading commands will be unavailable until a wallet is created or imported.');
@@ -577,46 +438,28 @@ async function main() {
 
 process.once('SIGINT', async () => {
   console.log('\n🛑 Shutting down gracefully...');
-  try {
-    if (pumpFunLimitOrderManager) {
-      pumpFunLimitOrderManager.stopMonitoring();
-    }
-    if (jupiterLimitOrderManager) {
-      jupiterLimitOrderManager.stopMonitoring();
-    }
-    if (priceMonitor) {
-      priceMonitor.stopAllMonitoring();
-    }
-    if (autoRefreshService) {
-      autoRefreshService.stopAll();
-    }
-    await prisma.$disconnect();
-    console.log('✅ Database disconnected');
-  } catch (error) {
-    console.error('❌ Error during shutdown:', error);
+  if (pumpFunLimitOrderManager) {
+    pumpFunLimitOrderManager.stopMonitoring();
+  }
+  if (jupiterLimitOrderManager) {
+    jupiterLimitOrderManager.stopMonitoring();
+  }
+  if (priceMonitor) {
+    priceMonitor.stopAllMonitoring();
   }
   bot.stop('SIGINT');
 });
 
 process.once('SIGTERM', async () => {
   console.log('\n🛑 Shutting down gracefully...');
-  try {
-    if (pumpFunLimitOrderManager) {
-      pumpFunLimitOrderManager.stopMonitoring();
-    }
-    if (jupiterLimitOrderManager) {
-      jupiterLimitOrderManager.stopMonitoring();
-    }
-    if (priceMonitor) {
-      priceMonitor.stopAllMonitoring();
-    }
-    if (autoRefreshService) {
-      autoRefreshService.stopAll();
-    }
-    await prisma.$disconnect();
-    console.log('✅ Database disconnected');
-  } catch (error) {
-    console.error('❌ Error during shutdown:', error);
+  if (pumpFunLimitOrderManager) {
+    pumpFunLimitOrderManager.stopMonitoring();
+  }
+  if (jupiterLimitOrderManager) {
+    jupiterLimitOrderManager.stopMonitoring();
+  }
+  if (priceMonitor) {
+    priceMonitor.stopAllMonitoring();
   }
   bot.stop('SIGTERM');
 });

@@ -1,0 +1,78 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Модель для хранения состояния торговой панели пользователя
+model UserPanelState {
+  userId       BigInt    @id
+  messageId    BigInt
+  tokenAddress String
+  mode         PanelMode
+  tokenData    Json
+  userData     Json
+  actionData   Json
+  waitingFor   String?
+  closed       Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+// Модель для отслеживания торговых позиций
+model Position {
+  id           String        @id @default(cuid())
+  userId       BigInt
+  tokenAddress String
+  entryPrice   Float // Средняя цена входа
+  size         Float // Текущий размер позиции в токенах
+  trades       Trade[]
+  linkedOrders LinkedOrder[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, tokenAddress])
+}
+
+// Модель для хранения истории сделок (покупок и продаж)
+model Trade {
+  id         String     @id @default(cuid())
+  position   Position   @relation(fields: [positionId], references: [id])
+  positionId String
+  type       TradeType
+  price      Float
+  size       Float // Количество токенов в сделке
+  timestamp  DateTime   @default(now())
+}
+
+// Модель для связи TP/SL ордеров с основной позицией
+model LinkedOrder {
+  id          String   @id @default(cuid())
+  position    Position @relation(fields: [positionId], references: [id])
+  positionId  String   @unique
+  tpOrderId   String? // ID ордера на Take Profit
+  slOrderId   String? // ID ордера на Stop Loss
+  orderType   String // "pumpfun" или "jupiter"
+  createdAt   DateTime @default(now())
+}
+
+// --- Enums ---
+
+enum PanelMode {
+  BUY
+  SELL
+  LIMIT
+  TRACK
+}
+
+enum TradeType {
+  BUY
+  SELL
+}

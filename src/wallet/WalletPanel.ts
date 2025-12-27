@@ -211,7 +211,8 @@ ${walletIcon} **Панель управления**
 
     private getMainMenuKeyboard() {
         return Markup.inlineKeyboard([
-            [Markup.button.callback('⚙️ Настройки кошелька', 'wallet_settings')]
+            [Markup.button.callback('⚙️ Настройки кошелька', 'wallet_settings')],
+            [Markup.button.callback('📊 Торговля', 'trade_panel')]
         ]);
     }
 
