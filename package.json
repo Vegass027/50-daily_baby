@@ -1,0 +1,36 @@
+{
+  "name": "solana-dex-bot",
+  "version": "1.0.0",
+  "description": "A production-ready Solana DEX trading bot with a Telegram interface.",
+  "main": "dist/bot.js",
+  "scripts": {
+    "start": "node dist/bot.js",
+    "build": "tsc",
+    "dev": "ts-node src/bot.ts"
+  },
+  "keywords": [
+    "solana",
+    "dex",
+    "trading-bot",
+    "telegram",
+    "typescript"
+  ],
+  "author": "Kilo Code",
+  "license": "MIT",
+  "dependencies": {
+    "@jup-ag/api": "^6.0.0",
+    "@solana/spl-token": "^0.4.8",
+    "@solana/web3.js": "^1.95.0",
+    "axios": "^1.7.2",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.5",
+    "jito-ts": "^4.1.0",
+    "telegraf": "^4.16.3",
+    "telegraf-ratelimit": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
