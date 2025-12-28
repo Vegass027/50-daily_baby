@@ -280,6 +280,15 @@ bot.command('create_wallet', async (ctx) => {
     try {
         const publicKey = await walletManager.createWallet();
         ctx.reply(`✅ Новый кошелек успешно создан!\n\nАдрес: \`${publicKey.toBase58()}\``, { parse_mode: 'Markdown' });
+        
+        // Инициализируем торговые компоненты, если они еще не инициализированы
+        if (!tradingPanel) {
+            const wallet = await walletManager.getWallet();
+            if (wallet) {
+                await initializeTradingComponents(wallet);
+                ctx.reply('🎯 Торговая панель готова к использованию!');
+            }
+        }
     } catch (error) {
         console.error(error);
         ctx.reply('❌ Произошла ошибка при создании кошелька.');
@@ -294,6 +303,15 @@ bot.command('import_wallet', async (ctx) => {
     try {
         const publicKey = await walletManager.importWallet(privateKey);
         ctx.reply(`✅ Кошелек успешно импортирован!\n\nАдрес: \`${publicKey.toBase58()}\``, { parse_mode: 'Markdown' });
+        
+        // Инициализируем торговые компоненты, если они еще не инициализированы
+        if (!tradingPanel) {
+            const wallet = await walletManager.getWallet();
+            if (wallet) {
+                await initializeTradingComponents(wallet);
+                ctx.reply('🎯 Торговая панель готова к использованию!');
+            }
+        }
     } catch (error) {
         console.error(error);
         ctx.reply('❌ Ошибка импорта. Убедитесь, что вы предоставили корректный приватный ключ в формате bs58.');
@@ -495,6 +513,103 @@ async function handleLimitOrderFill(order: LimitOrder): Promise<void> {
   }
 }
 
+// Функция для инициализации торговых компонентов
+async function initializeTradingComponents(wallet: Keypair) {
+  console.log('🎯 Initializing trading strategies...');
+  const pumpFunStrategy = new PumpFunStrategy(solanaProvider, wallet);
+  const jupiterStrategy = new JupiterStrategy(solanaProvider, wallet);
+  console.log('✅ Trading strategies created');
+  
+  console.log('🔀 Initializing trade router...');
+  tradeRouter = new TradeRouter([pumpFunStrategy, jupiterStrategy]);
+  console.log('✅ Trade router initialized.');
+  
+  // Initialize PriceMonitor
+  console.log('📊 Initializing price monitor...');
+  priceMonitor = new PriceMonitor(solanaProvider.connection, pumpFunStrategy);
+  console.log('✅ Price monitor initialized.');
+  
+  // Initialize PumpFun LimitOrderManager
+  console.log('📋 Initializing PumpFun limit order manager...');
+  pumpFunLimitOrderManager = new PumpFunLimitOrderManager(
+    pumpFunStrategy,
+    priceMonitor,
+    wallet,
+    userSettings
+  );
+  console.log('📋 Initializing PumpFun limit order manager...');
+  await pumpFunLimitOrderManager.initialize();
+  pumpFunLimitOrderManager.setOrderFilledCallback(handleLimitOrderFill);
+  console.log('📋 Starting PumpFun order monitoring...');
+  await pumpFunLimitOrderManager.monitorOrders();
+  console.log('✅ PumpFun limit order manager initialized and monitoring started.');
+  
+  // Initialize Jupiter LimitOrderManager
+  console.log('📋 Initializing Jupiter limit order manager...');
+  jupiterLimitOrderManager = new JupiterLimitOrderManager(
+    jupiterStrategy,
+    wallet,
+    userSettings
+  );
+  console.log('📋 Initializing Jupiter limit order manager...');
+  await jupiterLimitOrderManager.initialize();
+  jupiterLimitOrderManager.setOrderFilledCallback(handleLimitOrderFill);
+  console.log('📋 Starting Jupiter order monitoring...');
+  await jupiterLimitOrderManager.monitorOrders();
+  console.log('✅ Jupiter limit order manager initialized and monitoring started.');
+  
+  // Initialize new services for trading panel
+  console.log('🗄️ Initializing StateManager...');
+  stateManager = new StateManager();
+  console.log('✅ StateManager initialized.');
+
+  console.log('📊 Initializing TokenDataFetcher...');
+  tokenDataFetcher = new TokenDataFetcher(solanaProvider.connection);
+  console.log('✅ TokenDataFetcher initialized.');
+
+  console.log('📈 Initializing PositionTracker...');
+  positionTracker = new PositionTracker();
+  console.log('✅ PositionTracker initialized.');
+
+  console.log('🎯 Initializing TPSLManager...');
+  tpslManager = new TPSLManager(pumpFunLimitOrderManager, tokenDataFetcher);
+  console.log('✅ TPSLManager initialized.');
+
+  // Initialize TradingPanel without autoRefreshService first (to avoid circular dependency)
+  console.log('🎨 Initializing trading panel...');
+  tradingPanel = new TradingPanel(
+    bot,
+    tradeRouter,
+    pumpFunLimitOrderManager,
+    walletManager,
+    userSettings,
+    stateManager,
+    tokenDataFetcher,
+    positionTracker,
+    tpslManager,
+    null, // autoRefreshService will be set later
+    solanaProvider
+  );
+  console.log('✅ Trading panel initialized.');
+
+  console.log('🔄 Initializing AutoRefreshService...');
+  autoRefreshService = new AutoRefreshService(bot, stateManager!, tokenDataFetcher, tradingPanel, walletManager!, solanaProvider!);
+  console.log('✅ AutoRefreshService initialized.');
+  
+  // Initialize AutoRefreshService with Realtime subscriptions
+  await autoRefreshService.initialize();
+  console.log('✅ AutoRefreshService Realtime subscriptions initialized.');
+  
+  // Set autoRefreshService in TradingPanel via setter
+  tradingPanel.setAutoRefreshService(autoRefreshService);
+  console.log('✅ AutoRefreshService linked to TradingPanel.');
+  
+  // Restore all active panels from database
+  console.log('🔁 Restoring active panels...');
+  await autoRefreshService.restoreAllPanels();
+  console.log('✅ Active panels restored.');
+}
+
 async function main() {
   try {
     console.log('🗄️ Connecting to database...');
@@ -521,99 +636,7 @@ async function main() {
       console.log(`💰 Balance: ${DisplayHelper.formatBalance('Solana', balance)}`);
       
       // Initialize trading components
-      console.log('🎯 Initializing trading strategies...');
-      const pumpFunStrategy = new PumpFunStrategy(solanaProvider, wallet);
-      const jupiterStrategy = new JupiterStrategy(solanaProvider, wallet);
-      console.log('✅ Trading strategies created');
-      
-      console.log('🔀 Initializing trade router...');
-      tradeRouter = new TradeRouter([pumpFunStrategy, jupiterStrategy]);
-      console.log('✅ Trade router initialized.');
-      
-      // Initialize PriceMonitor
-      console.log('📊 Initializing price monitor...');
-      priceMonitor = new PriceMonitor(solanaProvider.connection, pumpFunStrategy);
-      console.log('✅ Price monitor initialized.');
-      
-      // Initialize PumpFun LimitOrderManager
-      console.log('📋 Initializing PumpFun limit order manager...');
-      pumpFunLimitOrderManager = new PumpFunLimitOrderManager(
-        pumpFunStrategy,
-        priceMonitor,
-        wallet,
-        userSettings
-      );
-      console.log('📋 Initializing PumpFun limit order manager...');
-      await pumpFunLimitOrderManager.initialize();
-      pumpFunLimitOrderManager.setOrderFilledCallback(handleLimitOrderFill);
-      console.log('📋 Starting PumpFun order monitoring...');
-      await pumpFunLimitOrderManager.monitorOrders();
-      console.log('✅ PumpFun limit order manager initialized and monitoring started.');
-      
-      // Initialize Jupiter LimitOrderManager
-      console.log('📋 Initializing Jupiter limit order manager...');
-      jupiterLimitOrderManager = new JupiterLimitOrderManager(
-        jupiterStrategy,
-        wallet,
-        userSettings
-      );
-      console.log('📋 Initializing Jupiter limit order manager...');
-      await jupiterLimitOrderManager.initialize();
-      jupiterLimitOrderManager.setOrderFilledCallback(handleLimitOrderFill);
-      console.log('📋 Starting Jupiter order monitoring...');
-      await jupiterLimitOrderManager.monitorOrders();
-      console.log('✅ Jupiter limit order manager initialized and monitoring started.');
-      
-      // Initialize new services for trading panel
-      console.log('🗄️ Initializing StateManager...');
-      stateManager = new StateManager();
-      console.log('✅ StateManager initialized.');
-
-      console.log('📊 Initializing TokenDataFetcher...');
-      tokenDataFetcher = new TokenDataFetcher(solanaProvider.connection);
-      console.log('✅ TokenDataFetcher initialized.');
-
-      console.log('📈 Initializing PositionTracker...');
-      positionTracker = new PositionTracker();
-      console.log('✅ PositionTracker initialized.');
-
-      console.log('🎯 Initializing TPSLManager...');
-      tpslManager = new TPSLManager(pumpFunLimitOrderManager, tokenDataFetcher);
-      console.log('✅ TPSLManager initialized.');
-
-      // Initialize TradingPanel without autoRefreshService first (to avoid circular dependency)
-      console.log('🎨 Initializing trading panel...');
-      tradingPanel = new TradingPanel(
-        bot,
-        tradeRouter,
-        pumpFunLimitOrderManager,
-        walletManager,
-        userSettings,
-        stateManager,
-        tokenDataFetcher,
-        positionTracker,
-        tpslManager,
-        null, // autoRefreshService will be set later
-        solanaProvider
-      );
-      console.log('✅ Trading panel initialized.');
-
-      console.log('🔄 Initializing AutoRefreshService...');
-      autoRefreshService = new AutoRefreshService(bot, stateManager!, tokenDataFetcher, tradingPanel, walletManager!, solanaProvider!);
-      console.log('✅ AutoRefreshService initialized.');
-      
-      // Initialize AutoRefreshService with Realtime subscriptions
-      await autoRefreshService.initialize();
-      console.log('✅ AutoRefreshService Realtime subscriptions initialized.');
-      
-      // Set autoRefreshService in TradingPanel via setter
-      tradingPanel.setAutoRefreshService(autoRefreshService);
-      console.log('✅ AutoRefreshService linked to TradingPanel.');
-      
-      // Restore all active panels from database
-      console.log('🔁 Restoring active panels...');
-      await autoRefreshService.restoreAllPanels();
-      console.log('✅ Active panels restored.');
+      await initializeTradingComponents(wallet);
       
     } else {
       console.warn('⚠️ Wallet not found. Trading commands will be unavailable until a wallet is created or imported.');
