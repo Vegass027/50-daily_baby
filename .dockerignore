@@ -1,47 +1,39 @@
 # Node modules
-node_modules
-npm-debug.log
-yarn-error.log
+node_modules/
+npm-debug.log*
 
-# Git
-.git
-.gitignore
-
-# IDE
-.vscode
-.idea
-
-# Environment
+# Environment files
 .env
 .env.local
 .env.*.local
 
-# Build output
-dist
+# Git
+.git/
+.gitignore
 
-# Prisma (кроме schema.prisma и dev.db)
-prisma/migrations
-!prisma/schema.prisma
-!prisma/dev.db
+# Build artifacts
+dist/
+*.tsbuildinfo
 
-# Data
-data/
+# Testing
+coverage/
+.nyc_output/
 
-# Logs
-logs
-*.log
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Documentation
-README.md
-docs/
-plans/
-.kilocode/
+# Prisma (SQLite - больше не нужен)
+prisma/dev.db
+prisma/*.db
+prisma/*.db-journal
 
-# Test files
-tests/
-*.test.ts
-*.spec.ts
+# Logs
+logs/
+*.log

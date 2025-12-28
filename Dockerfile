@@ -7,7 +7,7 @@ WORKDIR /app
 # Копируем package files
 COPY package*.json ./
 
-# Устанавливаем зависимости
+# Устанавливаем зависимости (включая @prisma/adapter-pg для PostgreSQL)
 RUN npm ci --only=production
 
 # Копируем исходный код
@@ -16,8 +16,8 @@ COPY . .
 # Собираем TypeScript
 RUN npm run build
 
-# Копируем базу данных (если есть)
-COPY prisma/dev.db ./prisma/dev.db 2>/dev/null || true
+# Генерируем Prisma Client для PostgreSQL
+RUN npx prisma generate
 
 # Создаем директорию для данных
 RUN mkdir -p /app/data
