@@ -4,7 +4,6 @@
   "description": "A production-ready Solana DEX trading bot with a Telegram interface.",
   "main": "dist/bot.js",
   "scripts": {
-    "postinstall": "prisma generate",
     "start": "node dist/bot.js",
     "build": "tsc",
     "dev": "ts-node src/bot.ts",

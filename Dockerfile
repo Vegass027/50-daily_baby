@@ -10,10 +10,11 @@ COPY package*.json ./
 # Копируем исходный код (включая prisma/ для схемы)
 COPY . .
 
-# Устанавливаем зависимости (включая @prisma/adapter-pg для PostgreSQL)
-RUN npm ci --only=production
+# Устанавливаем все зависимости (включая devDependencies для prisma generate)
+RUN npm ci
 
 # Генерируем Prisma Client для PostgreSQL
+# DATABASE_URL должен быть установлен в Render как build environment variable
 RUN npx prisma generate
 
 # Собираем TypeScript
