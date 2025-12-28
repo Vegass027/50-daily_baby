@@ -34,7 +34,7 @@ const ALLOWED_USERS = (process.env.ALLOWED_TELEGRAM_USERS || '').split(',').map(
 
 // 🧪 TESTING MODE LOGGING
 console.log('🧪 TESTING MODE ENABLED');
-console.log('📊 Database:', process.env.DATABASE_URL || 'file:./dev.db');
+console.log('📊 Database:', process.env.DATABASE_URL ? 'PostgreSQL connected' : 'file:./dev.db');
 console.log('👥 Allowed users:', ALLOWED_USERS);
 console.log('📡 RPC URL:', rpcUrl ? `${rpcUrl.substring(0, 20)}...` : 'NOT SET');
 
