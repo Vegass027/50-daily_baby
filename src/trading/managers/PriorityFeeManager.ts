@@ -7,10 +7,47 @@ import { Connection } from '@solana/web3.js';
 export class PriorityFeeManager {
   private connection: Connection;
   private cache: Map<string, { fee: number; timestamp: number }> = new Map();
-  private readonly CACHE_TTL = 5000; // 5 секунд кэширования
+  private readonly CACHE_TTL = 60000; // 60 секунд кэширования (оптимизация производительности)
+  private cleanupInterval: NodeJS.Timeout | null = null; // Интервал для автоочистки
 
   constructor(connection: Connection) {
     this.connection = connection;
+    
+    // Автоочистка каждые 5 минут
+    this.cleanupInterval = setInterval(() => {
+      this.clearExpiredEntries();
+    }, 300000);
+  }
+
+  /**
+   * Очистить устаревшие записи из кэша
+   */
+  private clearExpiredEntries(): void {
+    const now = Date.now();
+    let cleared = 0;
+    
+    for (const [key, value] of this.cache.entries()) {
+      if (now - value.timestamp >= this.CACHE_TTL) {
+        this.cache.delete(key);
+        cleared++;
+      }
+    }
+    
+    if (cleared > 0) {
+      console.log(`   🗑️ Cleared ${cleared} expired priority fee entries`);
+    }
+  }
+
+  /**
+   * Dispose для graceful shutdown
+   */
+  dispose(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+    this.clearCache();
+    console.log('[PriorityFeeManager] Disposed');
   }
 
   /**
@@ -92,9 +129,13 @@ export class PriorityFeeManager {
    * Вычислить медиану массива чисел
    */
   private calculateMedian(numbers: number[]): number {
+    if (numbers.length === 0) {
+      return 0;
+    }
+    
     const mid = Math.floor(numbers.length / 2);
-    return numbers.length % 2 !== 0 
-      ? numbers[mid] 
+    return numbers.length % 2 !== 0
+      ? numbers[mid]
       : Math.floor((numbers[mid - 1] + numbers[mid]) / 2);
   }
 
@@ -114,18 +155,25 @@ export class PriorityFeeManager {
    * Очистить кэш
    */
   clearCache(): void {
+    const size = this.cache.size;
     this.cache.clear();
-    console.log('   🗑️ Priority fee cache cleared');
+    if (size > 0) {
+      console.log(`   🗑️ Priority fee cache cleared (${size} entries)`);
+    }
   }
 
   /**
    * Получить статистику кэша
    */
   getCacheStats(): { size: number; entries: Array<{ key: string; age: number }> } {
-    const entries = Array.from(this.cache.entries()).map(([key, value]) => ({
-      key,
-      age: Date.now() - value.timestamp
-    }));
+    // Прямая итерация без создания копии
+    const entries = [];
+    for (const [key, value] of this.cache.entries()) {
+      entries.push({
+        key,
+        age: Date.now() - value.timestamp
+      });
+    }
     
     return {
       size: this.cache.size,

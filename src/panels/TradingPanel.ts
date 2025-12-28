@@ -7,11 +7,13 @@ import { UserSettings } from '../trading/router/ITradingStrategy';
 import { WalletManager } from '../wallet/WalletManager';
 import { StateManager } from '../services/StateManager';
 import { TokenDataFetcher } from '../services/TokenDataFetcher';
-import { PositionTracker } from '../services/PositionTracker';
+import { PositionManager } from '../trading/managers/PositionManager';
 import { TPSLManager } from '../services/TPSLManager';
 import { AutoRefreshService } from '../services/AutoRefreshService';
 import { SolanaProvider } from '../chains/SolanaProvider';
 import realtimeService from '../services/RealtimeService';
+import { UnifiedValidator } from '../utils/UnifiedValidator';
+import { ErrorFormatter } from '../utils/ErrorFormatter';
 import {
   UserPanelState,
   PanelMode,
@@ -27,6 +29,8 @@ import {
 export class TradingPanel {
   private lastTradeTime: Map<number, number> = new Map();
   private readonly TRADE_COOLDOWN = 3000; // 3 секунды
+  private readonly TRADE_COOLDOWN_CLEANUP = 300000; // 5 минут
+  private cleanupInterval: NodeJS.Timeout | null = null;
   private bot: Telegraf;
   private tradeRouter: TradeRouter;
   private limitOrderManager: ILimitOrderManager;
@@ -34,7 +38,7 @@ export class TradingPanel {
   private userSettings: UserSettings;
   private stateManager: StateManager;
   private tokenDataFetcher: TokenDataFetcher;
-  private positionTracker: PositionTracker;
+  private positionManager: PositionManager;
   private tpslManager: TPSLManager;
   private autoRefreshService: AutoRefreshService | null;
   private solanaProvider: SolanaProvider;
@@ -47,7 +51,7 @@ export class TradingPanel {
     userSettings: UserSettings,
     stateManager: StateManager,
     tokenDataFetcher: TokenDataFetcher,
-    positionTracker: PositionTracker,
+    positionManager: PositionManager,
     tpslManager: TPSLManager,
     autoRefreshService: AutoRefreshService | null,
     solanaProvider: SolanaProvider
@@ -59,10 +63,39 @@ export class TradingPanel {
     this.userSettings = userSettings;
     this.stateManager = stateManager;
     this.tokenDataFetcher = tokenDataFetcher;
-    this.positionTracker = positionTracker;
+    this.positionManager = positionManager;
     this.tpslManager = tpslManager;
     this.autoRefreshService = autoRefreshService;
     this.solanaProvider = solanaProvider;
+    
+    // Запускаем cleanup interval для Map структур
+    this.startCleanupInterval();
+  }
+
+  /**
+   * Запуск cleanup interval для очистки старых записей в Map
+   */
+  private startCleanupInterval(): void {
+    this.cleanupInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [userId, lastTime] of this.lastTradeTime.entries()) {
+        if (now - lastTime > this.TRADE_COOLDOWN_CLEANUP) {
+          this.lastTradeTime.delete(userId);
+        }
+      }
+    }, 60000); // Каждую минуту
+  }
+
+  /**
+   * Очистка ресурсов
+   */
+  dispose(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+    this.lastTradeTime.clear();
+    console.log('[TradingPanel] Disposed');
   }
 
   /**
@@ -328,7 +361,8 @@ export class TradingPanel {
       await this.updatePanelMessage(state);
     } catch (error: any) {
       console.error('[TradingPanel] Error handling callback:', error);
-      await ctx.reply(`❌ Error: ${(error as Error).message}`);
+      const userMessage = ErrorFormatter.formatUserFriendly(error);
+      await ctx.reply(userMessage);
     }
   }
 
@@ -375,7 +409,8 @@ export class TradingPanel {
       return true;
     } catch (error: any) {
       console.error('[TradingPanel] Error handling text input:', error);
-      await ctx.reply(`❌ Error: ${error.message}`);
+      const userMessage = ErrorFormatter.formatUserFriendly(error);
+      await ctx.reply(userMessage);
       // Сбрасываем флаг даже при ошибке, чтобы не застревать в ожидании
       state.waiting_for = undefined;
       await this.stateManager.setState(userId, state);
@@ -394,7 +429,7 @@ export class TradingPanel {
     if (modeMap[mode]) {
       state.mode = modeMap[mode];
       if (mode === 'track') {
-        const position = await this.positionTracker.getPosition(state.user_id, state.token_address);
+        const position = await this.positionManager.getPositionData(state.user_id, state.token_address);
         if (position) {
           state.action_data.position = position;
         }
@@ -488,33 +523,52 @@ export class TradingPanel {
 
   private async handleLimitPriceInput(state: UserPanelState, text: string): Promise<void> {
     const price = parseFloat(text);
-    if (isNaN(price) || price <= 0) {
-      throw new Error('Invalid price. Please enter a positive number.');
+    
+    // Используем валидатор
+    const validation = UnifiedValidator.validatePrice(price);
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
     }
+    
     state.action_data.limit_price = price;
   }
 
   private async handleLimitAmountInput(state: UserPanelState, text: string): Promise<void> {
     const amount = parseFloat(text);
-    if (isNaN(amount) || amount <= 0) {
-      throw new Error('Invalid amount. Please enter a positive number.');
+    
+    // Получаем баланс пользователя
+    const balance = state.user_data.sol_balance || 0;
+    
+    // Используем валидатор
+    const validation = UnifiedValidator.validateAmount(amount, balance);
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
     }
+    
     state.action_data.selected_amount = amount;
   }
 
   private async handleTPPriceInput(state: UserPanelState, text: string): Promise<void> {
     if (text.includes('%')) {
       const percent = parseFloat(text.replace('%', ''));
-      if (isNaN(percent) || percent <= 0) {
-        throw new Error('Invalid percentage. Please enter a positive number.');
+      
+      // Используем валидатор для take profit
+      const validation = UnifiedValidator.validateTakeProfitPercent(percent);
+      if (!validation.valid) {
+        throw new Error(validation.errors.join(', '));
       }
+      
       state.action_data.tp_percent = percent;
       state.action_data.tp_price = undefined;
     } else {
       const price = parseFloat(text);
-      if (isNaN(price) || price <= 0) {
-        throw new Error('Invalid price. Please enter a positive number.');
+      
+      // Используем валидатор для цены
+      const validation = UnifiedValidator.validatePrice(price);
+      if (!validation.valid) {
+        throw new Error(validation.errors.join(', '));
       }
+      
       state.action_data.tp_price = price;
       state.action_data.tp_percent = undefined;
     }
@@ -592,7 +646,7 @@ export class TradingPanel {
     const amountTokens = result.outputAmount / Math.pow(10, state.token_data.decimals || 9);
 
     // 5. Записать позицию
-    const updatedPosition = await this.positionTracker.recordTrade(state.user_id, token_address, 'BUY', price, amountTokens);
+    const updatedPosition = await this.positionManager.recordTrade(state.user_id, token_address, 'BUY', price, amountTokens);
 
     // 6. Обновить баланс пользователя
     const newBalance = await this.solanaProvider.getBalance(wallet.publicKey.toString());
@@ -605,9 +659,9 @@ export class TradingPanel {
     // 7. Обновить позицию в состоянии
     const currentPrice = await this.tokenDataFetcher.getCurrentPrice(token_address);
     if (currentPrice) {
-      const positionData = await this.positionTracker.getPosition(state.user_id, token_address);
+      const positionData = await this.positionManager.getPositionData(state.user_id, token_address);
       if (positionData) {
-        const pnl = this.positionTracker.calculatePNL(positionData, currentPrice);
+        const pnl = this.positionManager.calculatePNL(positionData, currentPrice);
         state.action_data.position = {
           ...positionData,
           current_price: currentPrice,
@@ -627,9 +681,10 @@ export class TradingPanel {
       } catch (error) {
         console.error('[TradingPanel] Failed to create TP/SL:', error);
         // Уведомить пользователя об ошибке
+        const userMessage = ErrorFormatter.formatUserFriendly(error);
         await this.bot.telegram.sendMessage(
           Number(state.user_id),
-          '⚠️ Warning: Failed to create TP/SL orders. Your position was opened but risk management is not active.'
+          `⚠️ Warning: ${userMessage}`
         );
       }
     }
@@ -651,7 +706,7 @@ export class TradingPanel {
     }
 
     // 1. Получить актуальную позицию
-    const position = await this.positionTracker.getPosition(user_id, token_address);
+    const position = await this.positionManager.getPositionData(user_id, token_address);
     if (!position || position.size <= 0) {
       throw new Error('No active position found to sell.');
     }
@@ -689,7 +744,7 @@ export class TradingPanel {
     const receivedSol = result.outputAmount / LAMPORTS_PER_SOL; // Получаем SOL из результата
 
     // 5. Записать сделку
-    const updatedPosition = await this.positionTracker.recordTrade(
+    const updatedPosition = await this.positionManager.recordTrade(
         user_id,
         token_address,
         'SELL',
@@ -712,11 +767,11 @@ export class TradingPanel {
     state.user_data.usd_balance = newBalanceSOL * solPriceUSD;
     
     // Обновить позицию в состоянии
-    const positionData = await this.positionTracker.getPosition(state.user_id, token_address);
+    const positionData = await this.positionManager.getPositionData(state.user_id, token_address);
     if (positionData && positionData.size > 0) {
       const currentPrice = await this.tokenDataFetcher.getCurrentPrice(token_address);
       if (currentPrice) {
-        const pnl = this.positionTracker.calculatePNL(positionData, currentPrice);
+        const pnl = this.positionManager.calculatePNL(positionData, currentPrice);
         state.action_data.position = {
           ...positionData,
           current_price: currentPrice,

@@ -3,6 +3,8 @@ import { AnchorProvider, Wallet } from '@coral-xyz/anchor';
 import { ITradingStrategy, SwapParams, QuoteResult, UserSettings } from '../../router/ITradingStrategy';
 import { SolanaProvider } from '../../../chains/SolanaProvider';
 import { STRATEGY_PRIORITY } from '../../../config/constants';
+import { ITransactionSubmitter, SimulationResult } from '../../../interfaces/ITransactionSubmitter';
+import { JitoTipCalculator } from '../../../utils/JitoTipCalculator';
 
 // Dynamic import for ESM module
 let PumpFunSDK: any;
@@ -60,26 +62,6 @@ export class PumpFunStrategy implements ITradingStrategy {
       });
     }
     return this.sdk;
-  }
-
-  /**
-   * Рассчитать динамический Jito tip на основе размера сделки
-   * @param amountInLamports - сумма сделки в лампортах
-   * @param multiplier - множитель tip (по умолчанию 1.0)
-   * @returns Jito tip в лампортах
-   */
-  private calculateJitoTip(amountInLamports: number, multiplier: number = 1.0): number {
-    // Базовый tip: 0.00001 SOL (10,000 lamports)
-    const baseTip = 10_000;
-    
-    // Динамический tip: 0.1% от суммы сделки
-    const dynamicTip = Math.floor(amountInLamports * 0.001);
-    
-    // Используем максимум из базового и динамического
-    const tip = Math.max(baseTip, dynamicTip);
-    
-    // Применяем множитель
-    return Math.floor(tip * multiplier);
   }
 
   async canTrade(tokenMint: string): Promise<boolean> {
@@ -145,15 +127,21 @@ export class PumpFunStrategy implements ITradingStrategy {
     // Определяем тип операции (buy или sell)
     const isBuy = params.tokenIn === 'So11111111111111111111111111111111111111112';
     
-    // Рассчитываем Jito tip если включена MEV защита
+    // Рассчитываем Jito tip используя централизованный калькулятор с учетом network congestion
     const useJito = extendedSettings.useJito !== false && settings.mevProtection;
-    const jitoTipMultiplier = extendedSettings.jitoTipMultiplier || 1.0;
-    const jitoTip = this.calculateJitoTip(params.amount, jitoTipMultiplier);
+    const jitoTip = await JitoTipCalculator.calculateOptimalTipWithCongestion(
+      params.amount,
+      this.chainProvider.connection,
+      {
+        isBondingCurve: true, // PumpFun всегда bonding curve
+        isVolatile: true, // Bonding curves более волатильны
+        customMultiplier: extendedSettings.jitoTipMultiplier || 1.0
+      }
+    );
 
     let result: any;
 
     if (useJito && sdk.jito) {
-      // Используем встроенную Jito поддержку
       console.log(`   🛡️ Using Jito MEV protection (tip: ${jitoTip} lamports)`);
       
       if (isBuy) {
@@ -177,8 +165,13 @@ export class PumpFunStrategy implements ITradingStrategy {
           'confirmed'
         );
       }
+      
+      // Логируем Jito метрики
+      console.log(`   📊 Jito metrics:`);
+      console.log(`      Tip paid: ${jitoTip} lamports (${(jitoTip / LAMPORTS_PER_SOL).toFixed(8)} SOL)`);
+      console.log(`      Trade amount: ${params.amount} lamports`);
+      console.log(`      Tip ratio: ${((jitoTip / params.amount) * 100).toFixed(4)}%`);
     } else {
-      // Обычная отправка без Jito
       console.log(`   📤 Sending transaction without Jito (MEV protection: ${settings.mevProtection})`);
       
       if (isBuy) {
@@ -210,6 +203,80 @@ export class PumpFunStrategy implements ITradingStrategy {
 
   supportsLimitOrders(): boolean {
     return false;
+  }
+
+  /**
+   * Построить swap транзакцию (без отправки)
+   * Используется для market orders
+   */
+  async buildTransaction(params: SwapParams): Promise<Transaction> {
+    const sdk = await this.ensureSDKInitialized();
+    const mintPk = new PublicKey(params.tokenOut);
+    const slippageBps = BigInt(Math.floor(params.slippage * 100));
+    const priorityFee = await this.chainProvider.getOptimalFee(params.tokenOut);
+    const PRIORITY_FEE = { unitLimit: 250_000, unitPrice: priorityFee };
+
+    // Определяем тип операции (buy или sell)
+    const isBuy = params.tokenIn === 'So11111111111111111111111111111111111111112';
+
+    console.log(`   🔨 Building PumpFun ${isBuy ? 'buy' : 'sell'} transaction...`);
+
+    let transaction: Transaction;
+
+    if (isBuy) {
+      transaction = await sdk.trade.createBuyTransaction(
+        this.wallet,
+        mintPk,
+        BigInt(params.amount),
+        slippageBps,
+        PRIORITY_FEE
+      );
+    } else {
+      transaction = await sdk.trade.createSellTransaction(
+        this.wallet,
+        mintPk,
+        BigInt(params.amount),
+        slippageBps,
+        PRIORITY_FEE
+      );
+    }
+
+    console.log(`   ✅ Transaction built successfully`);
+
+    return transaction;
+  }
+
+  /**
+   * Симулировать транзакцию
+   */
+  async simulateTransaction(transaction: Transaction): Promise<SimulationResult> {
+    try {
+      console.log(`   🔍 Simulating PumpFun transaction...`);
+
+      const connection = this.chainProvider.connection;
+      const simulation = await connection.simulateTransaction(transaction, [this.wallet]);
+
+      if (simulation.value.err) {
+        return {
+          success: false,
+          error: JSON.stringify(simulation.value.err),
+          logs: simulation.value.logs || undefined
+        };
+      }
+
+      console.log(`   ✅ Simulation successful`);
+
+      return {
+        success: true,
+        logs: simulation.value.logs || undefined
+      };
+    } catch (error) {
+      console.error(`   ❌ Simulation failed:`, error);
+      return {
+        success: false,
+        error: String(error)
+      };
+    }
   }
 
   private parseBondingCurveData(accountInfo: AccountInfo<Buffer>): BondingCurveData {

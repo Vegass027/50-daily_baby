@@ -8,12 +8,70 @@ type NavigationState = 'main' | 'wallet_settings' | 'address' | 'balance' | 'pri
 export class WalletPanel {
     private walletManager: WalletManager;
     private bot: Telegraf;
-    private userNavigation: Map<number, { state: NavigationState; messageId?: number }> = new Map();
+    private userNavigation: Map<number, { state: NavigationState; messageId?: number; timestamp: number }> = new Map();
+    private readonly NAVIGATION_CLEANUP_INTERVAL = 60000; // 1 минута
+    private readonly NAVIGATION_TTL = 3600000; // 1 час
+    private cleanupInterval: NodeJS.Timeout | null = null;
+    // Отслеживание сообщений с приватными ключами для автоудаления
+    private privateKeyMessages: Map<number, { messageId: number; chatId: number; deleteAt: number }> = new Map();
+    private readonly PRIVATE_KEY_DELETE_DELAY = 60000; // 60 секунд
 
     constructor(walletManager: WalletManager, bot: Telegraf) {
         this.walletManager = walletManager;
         this.bot = bot;
         this.setupHandlers();
+        this.startCleanupInterval();
+    }
+
+    /**
+     * Запуск cleanup interval для очистки старых записей навигации и сообщений с ключами
+     */
+    private startCleanupInterval(): void {
+        this.cleanupInterval = setInterval(() => {
+            const now = Date.now();
+            
+            // Очистка старых записей навигации
+            for (const [userId, navData] of this.userNavigation.entries()) {
+                if (now - navData.timestamp > this.NAVIGATION_TTL) {
+                    this.userNavigation.delete(userId);
+                }
+            }
+            
+            // Автоудаление сообщений с приватными ключами
+            for (const [userId, keyMsg] of this.privateKeyMessages.entries()) {
+                if (now >= keyMsg.deleteAt) {
+                    this.deletePrivateKeyMessage(userId, keyMsg);
+                }
+            }
+        }, this.NAVIGATION_CLEANUP_INTERVAL);
+    }
+    
+    /**
+     * Удаление сообщения с приватным ключом
+     */
+    private async deletePrivateKeyMessage(userId: number, keyMsg: { messageId: number; chatId: number; deleteAt: number }): Promise<void> {
+        try {
+            await this.bot.telegram.deleteMessage(keyMsg.chatId, keyMsg.messageId);
+            console.log(`[WalletPanel] Deleted private key message for user ${userId}`);
+        } catch (error) {
+            // Сообщение могло быть уже удалено пользователем
+            console.warn(`[WalletPanel] Failed to delete private key message for user ${userId}:`, error);
+        } finally {
+            this.privateKeyMessages.delete(userId);
+        }
+    }
+
+    /**
+     * Очистка ресурсов
+     */
+    dispose(): void {
+        if (this.cleanupInterval) {
+            clearInterval(this.cleanupInterval);
+            this.cleanupInterval = null;
+        }
+        this.userNavigation.clear();
+        this.privateKeyMessages.clear();
+        console.log('[WalletPanel] Disposed');
     }
 
     private setupHandlers() {
@@ -70,10 +128,11 @@ export class WalletPanel {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        // Сохраняем состояние навигации
-        this.userNavigation.set(userId, { 
-            state: newState, 
-            messageId: ctx.callbackQuery?.message?.message_id 
+        // Сохраняем состояние навигации с timestamp
+        this.userNavigation.set(userId, {
+            state: newState,
+            messageId: ctx.callbackQuery?.message?.message_id,
+            timestamp: Date.now()
         });
 
         await this.updateMessage(ctx, newState);
@@ -107,9 +166,11 @@ export class WalletPanel {
                 keyboard = this.getBackKeyboard('wallet_settings');
                 break;
             case 'private_key':
-                message = await this.getPrivateKeyMessage();
-                keyboard = this.getBackKeyboard('wallet_settings');
-                break;
+                // Для private_key отправляем отдельное сообщение с автоудалением
+                await this.sendPrivateKeyMessage(ctx);
+                // Возвращаемся в настройки кошелька
+                await this.handleNavigation(ctx, 'wallet_settings');
+                return; // Не обновляем текущее сообщение
             case 'create_wallet':
                 message = await this.getCreateWalletMessage();
                 keyboard = this.getBackKeyboard('wallet_settings');
@@ -145,10 +206,11 @@ export class WalletPanel {
                     ...keyboard
                 });
                 
-                // Сохраняем ID нового сообщения
+                // Сохраняем ID нового сообщения с timestamp
                 this.userNavigation.set(userId, {
                     state,
-                    messageId: sentMessage.message_id
+                    messageId: sentMessage.message_id,
+                    timestamp: Date.now()
                 });
             }
         } catch (error) {
@@ -161,7 +223,8 @@ export class WalletPanel {
             
             this.userNavigation.set(userId, {
                 state,
-                messageId: sentMessage.message_id
+                messageId: sentMessage.message_id,
+                timestamp: Date.now()
             });
         }
     }
@@ -170,7 +233,7 @@ export class WalletPanel {
         const userId = ctx.from?.id;
         if (!userId) return;
 
-        this.userNavigation.set(userId, { state: 'main' });
+        this.userNavigation.set(userId, { state: 'main', timestamp: Date.now() });
         await this.updateMessage(ctx, 'main');
     }
 
@@ -313,15 +376,24 @@ ${walletIcon} **Панель управления**
         `.trim();
     }
 
-    private async getPrivateKeyMessage(): Promise<string> {
+    /**
+     * Отправка сообщения с приватным ключом с автоудалением через 60 секунд
+     */
+    private async sendPrivateKeyMessage(ctx: Context): Promise<string> {
         const keypair = await this.walletManager.getWallet();
         if (!keypair) {
             return '❌ Кошелек не найден. Сначала создайте или импортируйте кошелек.';
         }
         
         const privateKey = bs58.encode(keypair.secretKey);
+        const userId = ctx.from?.id;
+        const chatId = ctx.chat?.id;
         
-        return `
+        if (!userId || !chatId) {
+            return '❌ Ошибка идентификации пользователя.';
+        }
+        
+        const message = `
 ⚠️ **⚠️ ОЧЕНЬ ВАЖНО ⚠️**
 
 ━━━━━━━━━
@@ -342,6 +414,50 @@ ${walletIcon} **Панель управления**
 • Запишите ключ на бумаге и храните в сейфе
 • Используйте менеджер паролей
 • Создайте резервную копию в нескольких безопасных местах
+
+⏰ **Это сообщение будет автоматически удалено через 60 секунд**
+        `.trim();
+        
+        // Отправляем сообщение
+        const sentMessage = await ctx.reply(message, { parse_mode: 'Markdown' });
+        
+        // Запланируем автоудаление через 60 секунд
+        const deleteAt = Date.now() + this.PRIVATE_KEY_DELETE_DELAY;
+        this.privateKeyMessages.set(userId, {
+            messageId: sentMessage.message_id,
+            chatId: chatId,
+            deleteAt: deleteAt
+        });
+        
+        console.log(`[WalletPanel] Scheduled private key message deletion for user ${userId} at ${new Date(deleteAt).toISOString()}`);
+        
+        return message;
+    }
+    
+    /**
+     * Получение сообщения с приватным ключом (для обновления UI)
+     */
+    private async getPrivateKeyMessage(): Promise<string> {
+        const keypair = await this.walletManager.getWallet();
+        if (!keypair) {
+            return '❌ Кошелек не найден. Сначала создайте или импортируйте кошелек.';
+        }
+        
+        return `
+⚠️ **⚠️ ОЧЕНЬ ВАЖНО ⚠️**
+
+━━━━━━━━━
+
+🔑 **Ваш приватный ключ будет отправлен отдельным сообщением**
+
+━━━━━━━━━
+
+🚨 **ПРЕДУПРЕЖДЕНИЕ:**
+• Приватный ключ будет отправлен отдельным сообщением
+• Это сообщение будет автоматически удалено через 60 секунд
+• Сохраните ключ в надежном месте до его удаления
+
+💡 **Нажмите кнопку ниже для получения ключа:**
         `.trim();
     }
 

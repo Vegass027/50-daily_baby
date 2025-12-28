@@ -26,7 +26,8 @@ export class TPSLManager {
   }
   
   /**
-   * Создает TP/SL ордера для указанной позиции в рамках одной транзакции.
+   * Создает TP/SL ордера для указанной позиции.
+   * Сначала создает ордера в блокчейне, затем записывает в БД.
    */
   async createTPSLOrders(
     position: Position,
@@ -57,18 +58,20 @@ export class TPSLManager {
       }
     }
 
-    return prisma.$transaction(async (tx) => {
-      let tpOrderId: string | undefined;
-      let slOrderId: string | undefined;
+    let tpOrderId: string | undefined;
+    let slOrderId: string | undefined;
 
-      try {
-        if (tpPrice) {
-          tpOrderId = await this.createSellOrder(tokenAddress, tpPrice, size, decimals, Number(userId));
-        }
-        if (slPrice) {
-          slOrderId = await this.createSellOrder(tokenAddress, slPrice, size, decimals, Number(userId));
-        }
-        
+    try {
+      // Шаг 1: Создаем ордера в блокчейне
+      if (tpPrice) {
+        tpOrderId = await this.createSellOrder(tokenAddress, tpPrice, size, decimals, Number(userId));
+      }
+      if (slPrice) {
+        slOrderId = await this.createSellOrder(tokenAddress, slPrice, size, decimals, Number(userId));
+      }
+
+      // Шаг 2: Записываем в БД с транзакцией
+      await prisma.$transaction(async (tx) => {
         // Удаляем старую связку, если она есть, и создаем новую
         await tx.linkedOrder.deleteMany({ where: { positionId } });
         await tx.linkedOrder.create({
@@ -79,19 +82,33 @@ export class TPSLManager {
             orderType: this.limitOrderManager.constructor.name,
           },
         });
+      });
 
-        console.log(`[TPSLManager] Created and linked TP/SL orders for position ${positionId}.`);
-        return { tpOrderId, slOrderId };
+      console.log(`[TPSLManager] Created and linked TP/SL orders for position ${positionId}.`);
+      return { tpOrderId, slOrderId };
 
-      } catch (error) {
-        // Транзакция автоматически откатит создание записей в БД.
-        // Нужно вручную откатить созданные в блокчейне ордера.
-        console.error(`[TPSLManager] Error in transaction for position ${positionId}. Rolling back blockchain orders...`, error);
-        if (tpOrderId) await this.limitOrderManager.cancelOrder(tpOrderId).catch(e => console.error(`[TPSLManager] Rollback failed for TP order ${tpOrderId}`, e));
-        if (slOrderId) await this.limitOrderManager.cancelOrder(slOrderId).catch(e => console.error(`[TPSLManager] Rollback failed for SL order ${slOrderId}`, e));
-        throw new Error('Failed to create TP/SL orders.');
+    } catch (error) {
+      // Rollback ВСЕХ созданных ордеров
+      console.error(`[TPSLManager] Error creating TP/SL orders. Rolling back...`, error);
+      
+      const rollbackPromises: Promise<void>[] = [];
+      if (tpOrderId) {
+        rollbackPromises.push(
+          this.limitOrderManager.cancelOrder(tpOrderId)
+            .catch(e => console.error(`[TPSLManager] Failed to cancel TP order ${tpOrderId}`, e))
+        );
       }
-    });
+      if (slOrderId) {
+        rollbackPromises.push(
+          this.limitOrderManager.cancelOrder(slOrderId)
+            .catch(e => console.error(`[TPSLManager] Failed to cancel SL order ${slOrderId}`, e))
+        );
+      }
+
+      // Ждем завершения всех rollback операций
+      await Promise.allSettled(rollbackPromises);
+      throw new Error('Failed to create TP/SL orders.');
+    }
   }
 
   private async createSellOrder(

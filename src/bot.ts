@@ -12,13 +12,22 @@ import { WalletPanel } from './wallet/WalletPanel';
 import { TradingPanel } from './panels/TradingPanel';
 import { PumpFunLimitOrderManager } from './trading/managers/PumpFunLimitOrderManager';
 import { JupiterLimitOrderManager } from './trading/managers/JupiterLimitOrderManager';
+import { DatabaseLimitOrderManager } from './trading/managers/DatabaseLimitOrderManager';
 import { PriceMonitor } from './trading/managers/PriceMonitor';
+import { OrderExecutor } from './trading/managers/OrderExecutor';
+import { OrderExpirationService } from './trading/managers/OrderExpirationService';
+import { TokenTypeDetector } from './trading/managers/TokenTypeDetector';
 import { StateManager } from './services/StateManager';
 import { TokenDataFetcher } from './services/TokenDataFetcher';
-import { PositionTracker } from './services/PositionTracker';
+import { PositionManager } from './trading/managers/PositionManager';
 import { TPSLManager } from './services/TPSLManager';
 import { AutoRefreshService } from './services/AutoRefreshService';
+import { AlchemySubmitter } from './services/AlchemySubmitter';
+import { UnifiedPriceService } from './services/UnifiedPriceService';
 import realtimeService from './services/RealtimeService';
+import { getTelegramNotifier } from './utils/TelegramNotifier';
+import { getHealthCheckServer } from './utils/HealthCheck';
+import { getMetricsManager } from './utils/Metrics';
 import { extractSolanaAddress } from './utils/SolanaAddressValidator';
 import { PanelMode } from './types/panel';
 import { LimitOrder } from './trading/managers/ILimitOrderManager';
@@ -51,13 +60,22 @@ let tradingPanel: TradingPanel | null = null;
 let priceMonitor: PriceMonitor | null = null;
 let pumpFunLimitOrderManager: PumpFunLimitOrderManager | null = null;
 let jupiterLimitOrderManager: JupiterLimitOrderManager | null = null;
+let databaseLimitOrderManager: DatabaseLimitOrderManager | null = null;
+let orderExecutor: OrderExecutor | null = null;
+let tokenTypeDetector: TokenTypeDetector | null = null;
 
 // Новые сервисы для торговой панели
 let stateManager: StateManager | null = null;
 let tokenDataFetcher: TokenDataFetcher | null = null;
-let positionTracker: PositionTracker | null = null;
+let positionManager: PositionManager | null = null;
 let tpslManager: TPSLManager | null = null;
 let autoRefreshService: AutoRefreshService | null = null;
+let orderExpirationService: OrderExpirationService | null = null;
+
+// Сервисы мониторинга и уведомлений
+let telegramNotifier = getTelegramNotifier();
+let healthCheckServer = getHealthCheckServer();
+let metricsManager = getMetricsManager();
 
 let userSettings: UserSettings = {
   slippage: 1.0,
@@ -278,7 +296,8 @@ bot.command('settings', async (ctx) => {
 
 bot.command('create_wallet', async (ctx) => {
     try {
-        const publicKey = await walletManager.createWallet();
+        const userId = ctx.from?.id;
+        const publicKey = await walletManager.createWallet(userId);
         ctx.reply(`✅ Новый кошелек успешно создан!\n\nАдрес: \`${publicKey.toBase58()}\``, { parse_mode: 'Markdown' });
         
         // Инициализируем торговые компоненты, если они еще не инициализированы
@@ -301,7 +320,8 @@ bot.command('import_wallet', async (ctx) => {
         return ctx.reply('Пожалуйста, укажите приватный ключ после команды. \nПример: `/import_wallet YOUR_PRIVATE_KEY`');
     }
     try {
-        const publicKey = await walletManager.importWallet(privateKey);
+        const userId = ctx.from?.id;
+        const publicKey = await walletManager.importWallet(privateKey, userId);
         ctx.reply(`✅ Кошелек успешно импортирован!\n\nАдрес: \`${publicKey.toBase58()}\``, { parse_mode: 'Markdown' });
         
         // Инициализируем торговые компоненты, если они еще не инициализированы
@@ -410,7 +430,8 @@ bot.on('text', async (ctx, next) => {
 
       const solBalance = await solanaProvider.getBalance(wallet.publicKey.toString());
       const solBalanceSOL = solBalance / LAMPORTS_PER_SOL;
-      const usdBalance = solBalanceSOL * 150; // Примерная цена SOL в USD
+      const solPriceUSD = await tokenDataFetcher.getSOLPriceInUSD();
+      const usdBalance = solBalanceSOL * (solPriceUSD || 150); // Реальная цена SOL в USD
 
       // Создать состояние пользователя
       const userState = {
@@ -475,8 +496,8 @@ bot.on('text', async (ctx, next) => {
 async function handleLimitOrderFill(order: LimitOrder): Promise<void> {
   console.log(`[Bot] Handling filled limit order ${order.id}...`);
   try {
-    if (!positionTracker || !tpslManager) {
-      console.error('[Bot] PositionTracker or TPSLManager not initialized.');
+    if (!positionManager || !tpslManager) {
+      console.error('[Bot] PositionManager or TPSLManager not initialized.');
       return;
     }
 
@@ -493,9 +514,9 @@ async function handleLimitOrderFill(order: LimitOrder): Promise<void> {
     console.log(`[Bot] Order filled for user ${userId}: ${order.id}`);
 
     if (orderType === 'buy') {
-      const position = await positionTracker.recordTrade(userId, tokenMint, 'BUY', filledPrice, filledAmount);
+      const position = await positionManager.recordTrade(userId, tokenMint, 'BUY', filledPrice, filledAmount);
       console.log(`[Bot] Recorded BUY trade for position ${position.id}`);
-
+      
       if (takeProfitPercent || stopLossPercent) {
         await tpslManager.createTPSLOrders(position, {
           tpPercent: takeProfitPercent,
@@ -504,8 +525,8 @@ async function handleLimitOrderFill(order: LimitOrder): Promise<void> {
         console.log(`[Bot] Created TP/SL orders for position ${position.id}`);
       }
     } else { // SELL
-        // Для TP/SL ордеров, которые являются SELL, мы просто записываем сделку.
-        await positionTracker.recordTrade(userId, tokenMint, 'SELL', filledPrice, filledAmount);
+      // Для TP/SL ордеров, которые являются SELL, мы просто записываем сделку.
+      await positionManager.recordTrade(userId, tokenMint, 'SELL', filledPrice, filledAmount);
         console.log(`[Bot] Recorded SELL trade for token ${tokenMint}`);
     }
   } catch (error) {
@@ -529,7 +550,34 @@ async function initializeTradingComponents(wallet: Keypair) {
   priceMonitor = new PriceMonitor(solanaProvider.connection, pumpFunStrategy);
   console.log('✅ Price monitor initialized.');
   
-  // Initialize PumpFun LimitOrderManager
+  // Initialize OrderExecutor
+  console.log('⚡ Initializing order executor...');
+  const alchemyApiKey = process.env.ALCHEMY_SOLANA_API_KEY || process.env.ALCHEMY_API_KEY;
+  if (!alchemyApiKey) {
+    throw new Error('ALCHEMY_SOLANA_API_KEY environment variable is not set');
+  }
+  const transactionSubmitter = new AlchemySubmitter(alchemyApiKey);
+  orderExecutor = new OrderExecutor(
+    jupiterStrategy,
+    pumpFunStrategy,
+    transactionSubmitter,
+    wallet,
+    userSettings,
+    null // jitoAuthKeypair - можно добавить позже
+  );
+  console.log('✅ Order executor initialized.');
+  
+  // Initialize UnifiedPriceService
+  console.log('💱 Initializing unified price service...');
+  const unifiedPriceService = new UnifiedPriceService();
+  console.log('✅ Unified price service initialized.');
+  
+  // Initialize TokenTypeDetector
+  console.log('🔍 Initializing token type detector...');
+  tokenTypeDetector = new TokenTypeDetector(unifiedPriceService);
+  console.log('✅ Token type detector initialized.');
+  
+  // Initialize individual managers (для обратной совместимости)
   console.log('📋 Initializing PumpFun limit order manager...');
   pumpFunLimitOrderManager = new PumpFunLimitOrderManager(
     pumpFunStrategy,
@@ -537,26 +585,57 @@ async function initializeTradingComponents(wallet: Keypair) {
     wallet,
     userSettings
   );
-  console.log('📋 Initializing PumpFun limit order manager...');
   await pumpFunLimitOrderManager.initialize();
-  pumpFunLimitOrderManager.setOrderFilledCallback(handleLimitOrderFill);
-  console.log('📋 Starting PumpFun order monitoring...');
-  await pumpFunLimitOrderManager.monitorOrders();
-  console.log('✅ PumpFun limit order manager initialized and monitoring started.');
+  pumpFunLimitOrderManager.setOrderExecutor(orderExecutor);
+  console.log('✅ PumpFun limit order manager initialized.');
   
-  // Initialize Jupiter LimitOrderManager
   console.log('📋 Initializing Jupiter limit order manager...');
   jupiterLimitOrderManager = new JupiterLimitOrderManager(
     jupiterStrategy,
     wallet,
     userSettings
   );
-  console.log('📋 Initializing Jupiter limit order manager...');
   await jupiterLimitOrderManager.initialize();
-  jupiterLimitOrderManager.setOrderFilledCallback(handleLimitOrderFill);
-  console.log('📋 Starting Jupiter order monitoring...');
+  jupiterLimitOrderManager.setOrderExecutor(orderExecutor);
+  console.log('✅ Jupiter limit order manager initialized.');
+  
+  // Initialize DatabaseLimitOrderManager (основной менеджер)
+  console.log('🗄️ Initializing database limit order manager...');
+  const projectId = process.env.SUPABASE_PROJECT_ID;
+  if (!projectId) {
+    throw new Error('SUPABASE_PROJECT_ID environment variable is not set');
+  }
+  
+  databaseLimitOrderManager = new DatabaseLimitOrderManager(
+    jupiterLimitOrderManager!,
+    pumpFunLimitOrderManager!,
+    priceMonitor!,
+    orderExecutor!,
+    tokenTypeDetector!,
+    projectId
+  );
+  await databaseLimitOrderManager.initialize();
+  databaseLimitOrderManager.setOrderFilledCallback(handleLimitOrderFill);
+  console.log('✅ Database limit order manager initialized.');
+  
+  // Initialize OrderExpirationService
+  console.log('⏰ Initializing order expiration service...');
+  const { DatabaseOrderRepository } = await import('./database/DatabaseOrderRepository.js');
+  const orderRepository = new DatabaseOrderRepository(projectId);
+  orderExpirationService = new OrderExpirationService(
+    orderRepository,
+    (orderId) => {
+      console.log(`⏰ Order ${orderId} expired and cancelled`);
+    }
+  );
+  orderExpirationService.start();
+  console.log('✅ Order expiration service started.');
+  
+  // Запуск мониторинга через DatabaseLimitOrderManager
+  console.log('🔄 Starting order monitoring...');
+  await pumpFunLimitOrderManager.monitorOrders();
   await jupiterLimitOrderManager.monitorOrders();
-  console.log('✅ Jupiter limit order manager initialized and monitoring started.');
+  console.log('✅ Order monitoring started.');
   
   // Initialize new services for trading panel
   console.log('🗄️ Initializing StateManager...');
@@ -567,9 +646,9 @@ async function initializeTradingComponents(wallet: Keypair) {
   tokenDataFetcher = new TokenDataFetcher(solanaProvider.connection);
   console.log('✅ TokenDataFetcher initialized.');
 
-  console.log('📈 Initializing PositionTracker...');
-  positionTracker = new PositionTracker();
-  console.log('✅ PositionTracker initialized.');
+  console.log('📈 Initializing PositionManager...');
+  positionManager = new PositionManager();
+  console.log('✅ PositionManager initialized.');
 
   console.log('🎯 Initializing TPSLManager...');
   tpslManager = new TPSLManager(pumpFunLimitOrderManager, tokenDataFetcher);
@@ -585,7 +664,7 @@ async function initializeTradingComponents(wallet: Keypair) {
     userSettings,
     stateManager,
     tokenDataFetcher,
-    positionTracker,
+    positionManager,
     tpslManager,
     null, // autoRefreshService will be set later
     solanaProvider
@@ -603,6 +682,17 @@ async function initializeTradingComponents(wallet: Keypair) {
   // Set autoRefreshService in TradingPanel via setter
   tradingPanel.setAutoRefreshService(autoRefreshService);
   console.log('✅ AutoRefreshService linked to TradingPanel.');
+  
+  // Initialize TelegramNotifier
+  console.log('📱 Initializing Telegram notifier...');
+  telegramNotifier.setBot(bot);
+  telegramNotifier.startAutoFlush();
+  console.log('✅ Telegram notifier initialized.');
+  
+  // Start Health Check Server
+  console.log('🏥 Starting health check server...');
+  await healthCheckServer.start();
+  console.log('✅ Health check server started.');
   
   // Restore all active panels from database
   console.log('🔁 Restoring active panels...');
@@ -662,22 +752,58 @@ async function main() {
 process.once('SIGINT', async () => {
   console.log('\n🛑 Shutting down gracefully...');
   try {
+    // Останавливаем мониторинг через DatabaseLimitOrderManager
+    if (databaseLimitOrderManager) {
+      await databaseLimitOrderManager.shutdown();
+    }
+    
+    // Останавливаем OrderExpirationService
+    if (orderExpirationService) {
+      orderExpirationService.stop();
+      console.log('✅ Order expiration service stopped');
+    }
+    
     // Отписаться от Realtime
     await realtimeService.unsubscribeAll();
     console.log('✅ Realtime disconnected');
     
-    if (pumpFunLimitOrderManager) {
-      pumpFunLimitOrderManager.stopMonitoring();
-    }
-    if (jupiterLimitOrderManager) {
-      jupiterLimitOrderManager.stopMonitoring();
-    }
     if (priceMonitor) {
       priceMonitor.stopAllMonitoring();
     }
     if (autoRefreshService) {
       autoRefreshService.stopAll();
     }
+    
+    // Остановить TradingPanel
+    if (tradingPanel) {
+      tradingPanel.dispose();
+      console.log('✅ TradingPanel disposed');
+    }
+    
+    // Остановить WalletPanel
+    if (walletPanel) {
+      walletPanel.dispose();
+      console.log('✅ WalletPanel disposed');
+    }
+    
+    // Остановить StateManager
+    if (stateManager) {
+      stateManager.dispose();
+      console.log('✅ StateManager disposed');
+    }
+    
+    // Остановить TelegramNotifier
+    telegramNotifier.stopAutoFlush();
+    console.log('✅ Telegram notifier stopped');
+    
+    // Остановить Health Check Server
+    healthCheckServer.stop();
+    console.log('✅ Health check server stopped');
+    
+    // Освобождаем ресурсы SolanaProvider
+    solanaProvider.dispose();
+    console.log('✅ Solana provider disposed');
+    
     await prisma.$disconnect();
     console.log('✅ Database disconnected');
   } catch (error) {
@@ -689,22 +815,58 @@ process.once('SIGINT', async () => {
 process.once('SIGTERM', async () => {
   console.log('\n🛑 Shutting down gracefully...');
   try {
+    // Останавливаем мониторинг через DatabaseLimitOrderManager
+    if (databaseLimitOrderManager) {
+      await databaseLimitOrderManager.shutdown();
+    }
+    
+    // Останавливаем OrderExpirationService
+    if (orderExpirationService) {
+      orderExpirationService.stop();
+      console.log('✅ Order expiration service stopped');
+    }
+    
     // Отписаться от Realtime
     await realtimeService.unsubscribeAll();
     console.log('✅ Realtime disconnected');
     
-    if (pumpFunLimitOrderManager) {
-      pumpFunLimitOrderManager.stopMonitoring();
-    }
-    if (jupiterLimitOrderManager) {
-      jupiterLimitOrderManager.stopMonitoring();
-    }
     if (priceMonitor) {
       priceMonitor.stopAllMonitoring();
     }
     if (autoRefreshService) {
       autoRefreshService.stopAll();
     }
+    
+    // Остановить TradingPanel
+    if (tradingPanel) {
+      tradingPanel.dispose();
+      console.log('✅ TradingPanel disposed');
+    }
+    
+    // Остановить WalletPanel
+    if (walletPanel) {
+      walletPanel.dispose();
+      console.log('✅ WalletPanel disposed');
+    }
+    
+    // Остановить StateManager
+    if (stateManager) {
+      stateManager.dispose();
+      console.log('✅ StateManager disposed');
+    }
+    
+    // Остановить TelegramNotifier
+    telegramNotifier.stopAutoFlush();
+    console.log('✅ Telegram notifier stopped');
+    
+    // Остановить Health Check Server
+    healthCheckServer.stop();
+    console.log('✅ Health check server stopped');
+    
+    // Освобождаем ресурсы SolanaProvider
+    solanaProvider.dispose();
+    console.log('✅ Solana provider disposed');
+    
     await prisma.$disconnect();
     console.log('✅ Database disconnected');
   } catch (error) {

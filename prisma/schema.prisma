@@ -32,6 +32,9 @@ model UserPanelState {
   closed              Boolean   @default(false)
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
+
+  @@index([userId, closed, updatedAt(sort: Desc)], name: "idx_userpanelstate_user_closed_updated")
+  @@index([tokenAddress, updatedAt(sort: Desc)], name: "idx_userpanelstate_token_updated")
 }
 
 // Модель для отслеживания торговых позиций
@@ -39,38 +42,89 @@ model Position {
   id           String        @id @default(cuid())
   userId       BigInt        // BigInt для Telegram IDs
   tokenAddress String
-  entryPrice   Float // Средняя цена входа
-  size         Float // Текущий размер позиции в токенах
-  trades       Trade[]
-  linkedOrders LinkedOrder[]
+  tokenType    String        // "DEX_POOL" или "BONDING_CURVE"
+  entryPrice   Float         // Средняя цена входа
+  size         Float         // Текущий размер позиции в токенах
+  status       String        @default("OPEN") // "OPEN" или "CLOSED"
+  orderType    String        // "MARKET_BUY" или "LIMIT_BUY"
+  openTxSignature String?    // Подпись транзакции открытия
+  exitPrice    Float?        // Цена выхода
+  closedAt     DateTime?     // Время закрытия
+  exitTxSignature String?     // Подпись транзакции закрытия
+  realizedPnL  Float?       // Реализованный P&L в SOL
+  realizedPnLPercent Float?   // Реализованный P&L в процентах
+  trades       Trade[]      @relation onDelete: Cascade
+  linkedOrders LinkedOrder[] @relation onDelete: Cascade
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@index([userId, updatedAt(sort: Desc)], name: "idx_position_user_status_updated")
+  @@index([tokenAddress, updatedAt(sort: Desc)], name: "idx_position_token_updated")
+  @@index([updatedAt(sort: Desc)], name: "idx_position_status_updated")
   @@unique([userId, tokenAddress])
 }
 
 // Модель для хранения лимитных ордеров
 model Order {
-  id          String     @id @default(cuid())
-  userId      BigInt     // Telegram ID пользователя
-  type        String     // "LIMIT", "TAKE_PROFIT", "STOP_LOSS"
-  side        String     // "BUY" или "SELL"
-  tokenMint   String
-  amount      Float      // Количество в SOL или токенах
-  price       Float      // Целевая цена
-  status      String     // "PENDING", "FILLED", "CANCELLED"
-  filledPrice Float?     // Цена исполнения
-  filledAmount Float?     // Количество исполнения
-  params      String     // JSON параметры ордера
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @updatedAt
+  id                      String    @id @default(cuid())
+  userId                  BigInt    // Telegram ID пользователя
+  type                    String    // "LIMIT", "TAKE_PROFIT", "STOP_LOSS"
+  side                    String    // "BUY" или "SELL"
+  tokenMint               String
+  amount                  Float     // Количество в SOL или токенах
+  price                   Float     // Целевая цена
+  status                  String    // "PENDING", "FILLED", "CANCELLED", "EXPIRED", "ERROR", "INACTIVE"
+  filledPrice             Float?    // Цена исполнения
+  filledAmount            Float?    // Количество исполнения
+  params                  String    // JSON параметры ордера
+  linkedBuyOrderId        String?   // ID связанного buy ордера
+  linkedTakeProfitOrderId String?   // ID связанного take profit ордера
+  linkedPositionId        String?   // ID связанной позиции
+  tokenType               String?   // "DEX_POOL" или "BONDING_CURVE"
+  takeProfitPercent       Float?    // Процент take profit
+  signature               String?   // Подпись транзакции
+  jitoTip                 Float?    // Размер Jito tip в lamports
+  error                   String?   // Текст ошибки
+  retryCount              Int       @default(0)
+  lastRetryAt             DateTime?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+  metrics                 OrderMetrics[]
+
+  @@index([userId, status, createdAt(sort: Desc)], name: "idx_order_user_status_created")
+  @@index([tokenMint, tokenType, status], name: "idx_order_token_type_status")
+  @@index([status, updatedAt(sort: Desc)], name: "idx_order_status_updated")
+  @@index([linkedPositionId, status], name: "idx_order_linked_position_status")
+  @@index([linkedBuyOrderId, status], name: "idx_order_takeprofit_active")
+  @@index([createdAt(sort: Desc)], name: "idx_order_created")
+}
+
+// Модель для хранения метрик исполнения ордеров (для аналитики)
+model OrderMetrics {
+  id             String   @id @default(cuid())
+  orderId        String
+  userId         BigInt
+  executionTime  Float     // Время исполнения в миллисекундах
+  jitoFee       Float?    // Jito fee в lamports
+  priceImpact    Float?    // Price impact в процентах
+  slippage      Float?    // Slippage в процентах
+  success        Boolean
+  errorType      String?   // Тип ошибки (если неуспешно)
+  timestamp      DateTime  @default(now())
+
+  order          Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([userId, success, timestamp(sort: Desc)], name: "idx_ordermetrics_user_success_timestamp")
+  @@index([orderId, timestamp(sort: Desc)], name: "idx_ordermetrics_order_timestamp")
+  @@index([timestamp(sort: Desc)], where: { success: true }, name: "idx_ordermetrics_success_timestamp")
+  @@index([timestamp(sort: Desc)], where: { success: false }, name: "idx_ordermetrics_failed_timestamp")
 }
 
 // Модель для хранения истории сделок (покупок и продаж)
 model Trade {
   id         String     @id @default(cuid())
-  position   Position   @relation(fields: [positionId], references: [id])
+  position   Position   @relation(fields: [positionId], references: [id], onDelete: Cascade)
   positionId String
   type       TradeType
   price      Float
@@ -81,12 +135,15 @@ model Trade {
 // Модель для связи TP/SL ордеров с основной позицией
 model LinkedOrder {
   id          String   @id @default(cuid())
-  position    Position @relation(fields: [positionId], references: [id])
+  position    Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
   positionId  String   @unique
   tpOrderId   String? // ID ордера на Take Profit
   slOrderId   String? // ID ордера на Stop Loss
   orderType   String // "pumpfun" или "jupiter"
   createdAt   DateTime @default(now())
+  
+  @@index([tpOrderId])
+  @@index([slOrderId])
 }
 
 // --- Enums ---

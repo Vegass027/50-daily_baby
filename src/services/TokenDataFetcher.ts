@@ -36,17 +36,6 @@ interface BirdeyeTokenOverview {
   updateUnixTime: number;
 }
 
-interface BirdeyePriceMultiple {
-  data: {
-    [address: string]: {
-      value: number;
-      updateUnixTime: number;
-      updateHumanTime: string;
-    };
-  };
-  success: boolean;
-}
-
 interface DexScreenerPair {
   chainId: string;
   dexId: string;
@@ -83,7 +72,7 @@ export class TokenDataFetcher {
   private readonly BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
   private readonly BIRDEYE_BASE_URL = 'https://public-api.birdeye.so';
   private solPriceCache: { price: number; timestamp: number } | null = null;
-  private readonly SOL_PRICE_CACHE_TTL = 60000; // 1 минута
+  private readonly SOL_PRICE_CACHE_TTL = 300000; // 5 минут (для снижения нагрузки на API)
 
   // Статистика использования API
   private stats = {
@@ -93,6 +82,9 @@ export class TokenDataFetcher {
     cacheHits: 0,
     errors: 0,
   };
+
+  // Интервал для логирования статистики (для предотвращения memory leak)
+  private statsInterval: NodeJS.Timeout | null = null;
 
   constructor(connection: Connection) {
     this.connection = connection;
@@ -104,7 +96,7 @@ export class TokenDataFetcher {
     }
 
     // Логируем статистику каждый час
-    setInterval(() => this.logStats(), 3600000);
+    this.statsInterval = setInterval(() => this.logStats(), 3600000);
   }
 
   /**
@@ -344,7 +336,7 @@ export class TokenDataFetcher {
 
   /**
    * Получить текущую цену только для одного токена
-   * Используется в других сервисах (PositionTracker, TPSLManager)
+   * Используется в других сервисах (PositionManager, TPSLManager)
    */
   async getCurrentPrice(tokenAddress: string): Promise<number | null> {
     // Проверяем кеш
@@ -371,26 +363,26 @@ export class TokenDataFetcher {
     try {
       // Используем Birdeye для получения цены SOL
       if (this.BIRDEYE_API_KEY) {
-        const response = await axios.get<BirdeyePriceMultiple>(
+        const response = await axios.get<{ success: boolean; data: { price: number; symbol: string; name: string } }>(
           `${this.BIRDEYE_BASE_URL}/defi/price`,
           {
             headers: {
               'X-API-KEY': this.BIRDEYE_API_KEY,
             },
             params: {
-              list_address: this.WSOL_MINT,
+              address: this.WSOL_MINT,
+              chain: 'solana',
             },
             timeout: 3000,
           }
         );
 
-        const solData = response.data?.data?.[this.WSOL_MINT];
-        if (solData?.value) {
+        if (response.data?.success && response.data?.data?.price) {
           this.solPriceCache = {
-            price: solData.value,
+            price: response.data.data.price,
             timestamp: Date.now(),
           };
-          return solData.value;
+          return response.data.data.price;
         }
       }
 
@@ -427,6 +419,18 @@ export class TokenDataFetcher {
   }
 
   /**
+   * Очистить ресурсы (вызывать при завершении работы)
+   */
+  dispose(): void {
+    if (this.statsInterval) {
+      clearInterval(this.statsInterval);
+      this.statsInterval = null;
+    }
+    this.clearCache();
+    console.log('[TokenDataFetcher] Disposed');
+  }
+
+  /**
    * Получить статистику использования API
    */
   getStats() {
@@ -460,7 +464,10 @@ export class TokenDataFetcher {
   /**
    * Форматировать USD для логов
    */
-  private formatUSD(amount: number): string {
+  private formatUSD(amount: number | undefined | null): string {
+    if (amount === undefined || amount === null || isNaN(amount)) {
+      return '$0.00';
+    }
     if (amount >= 1_000_000) {
       return `$${(amount / 1_000_000).toFixed(2)}M`;
     } else if (amount >= 1_000) {

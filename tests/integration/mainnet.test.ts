@@ -28,16 +28,16 @@ describe('Mainnet Integration Tests', () => {
   let userSettings: UserSettings;
 
   beforeAll(async () => {
-    // Проверяем, что мы на mainnet
-    if (process.env.SOLANA_NETWORK === 'devnet') {
-      console.warn('⚠️  WARNING: Running mainnet tests on devnet. Set SOLANA_NETWORK=mainnet');
-    }
+  // Проверяем, что мы на mainnet
+  if (process.env.SOLANA_NETWORK === 'devnet') {
+    console.warn('⚠️  WARNING: Running mainnet tests on devnet. Set SOLANA_NETWORK=mainnet');
+  }
 
-    const mainnetRpc = process.env.ALCHEMY_SOLANA_RPC || process.env.QUICKNODE_RPC_URL;
-    
-    if (!mainnetRpc) {
-      throw new Error('MAINNET_RPC_URL must be provided for mainnet tests');
-    }
+  const mainnetRpc = process.env.MAINNET_RPC_URL || process.env.ALCHEMY_SOLANA_RPC || process.env.QUICKNODE_RPC_URL;
+  
+  if (!mainnetRpc) {
+    throw new Error('MAINNET_RPC_URL must be provided for mainnet tests');
+  }
 
     console.log('🔗 Connecting to mainnet...');
     console.log('⚠️  WARNING: These tests will use REAL SOL!');

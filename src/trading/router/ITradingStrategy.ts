@@ -1,3 +1,4 @@
+import { Transaction } from '@solana/web3.js';
 import { IChainProvider } from '../../chains/IChainProvider';
 
 export interface QuoteResult {
@@ -22,6 +23,8 @@ export interface UserSettings {
   speedStrategy: 'low' | 'normal' | 'aggressive';
   useJito?: boolean; // Использовать Jito для MEV защиты
   jitoTipMultiplier?: number; // Множитель Jito tip (1.0 = стандартный)
+  priorityFee?: number; // Priority fee в микролампортах
+  skipPreflight?: boolean; // Пропустить preflight симуляцию
 }
 
 export interface ITradingStrategy {
@@ -34,5 +37,6 @@ export interface ITradingStrategy {
   canTrade(tokenMint: string): Promise<boolean>;
   getQuote(params: SwapParams): Promise<QuoteResult>;
   executeSwap(params: SwapParams, settings: UserSettings): Promise<string>;
+  buildTransaction(params: SwapParams): Promise<Transaction>;
   supportsLimitOrders(): boolean;
 }

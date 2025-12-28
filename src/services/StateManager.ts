@@ -10,9 +10,26 @@ import { Prisma } from '@prisma/client';
  */
 export class StateManager {
   private readonly CACHE_TTL: number = 3600000; // 1 час
+  private cache = new Map<number, { state: UserPanelState; timestamp: number }>();
+  private readonly CACHE_TTL_MS = 5000; // 5 секунд для in-memory кэша
+  private cleanupInterval: NodeJS.Timeout;
 
   constructor() {
-    setInterval(() => this.cleanupInactiveStates(), this.CACHE_TTL);
+    this.cleanupInterval = setInterval(
+      () => this.cleanupInactiveStates(),
+      this.CACHE_TTL
+    );
+  }
+
+  /**
+   * Очистка ресурсов при завершении работы
+   */
+  dispose(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+    }
+    this.cache.clear();
+    console.log('[StateManager] Disposed');
   }
 
   private toAppState(dbState: PrismaUserPanelState): UserPanelState {
@@ -65,12 +82,22 @@ export class StateManager {
   }
 
   async getState(userId: number): Promise<UserPanelState | null> {
+    // Check cache first
+    const cached = this.cache.get(userId);
+    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+      return cached.state;
+    }
+    
+    // Fetch from DB
     const dbState = await prisma.userPanelState.findUnique({
       where: { userId: BigInt(userId) }, // ИЗМЕНЕНО: конвертируем в BigInt
     });
 
     if (dbState && !dbState.closed) {
-      return this.toAppState(dbState);
+      const state = this.toAppState(dbState);
+      // Update cache
+      this.cache.set(userId, { state, timestamp: Date.now() });
+      return state;
     }
     return null;
   }
@@ -88,6 +115,9 @@ export class StateManager {
           userId: BigInt(userId), // ИЗМЕНЕНО
         },
       });
+      
+      // Update cache
+      this.cache.set(userId, { state, timestamp: Date.now() });
     } catch (error) {
       console.error(`[StateManager] Error setting state for user ${userId}:`, error);
       throw error;
@@ -97,6 +127,9 @@ export class StateManager {
   async deleteState(userId: number): Promise<void> {
     try {
       await prisma.userPanelState.delete({ where: { userId: BigInt(userId) } }); // ИЗМЕНЕНО
+      
+      // Invalidate cache
+      this.cache.delete(userId);
     } catch (error: any) {
       if (error.code !== 'P2025') { // 'P2025' is Prisma's code for "record not found"
         throw error;
@@ -118,6 +151,9 @@ export class StateManager {
         where: { userId: BigInt(userId) }, // ИЗМЕНЕНО
         data: { [field]: JSON.stringify(newJson) },
       });
+      
+      // Invalidate cache
+      this.cache.delete(userId);
     }
   }
 

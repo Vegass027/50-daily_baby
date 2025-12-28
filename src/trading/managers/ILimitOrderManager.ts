@@ -10,10 +10,12 @@ export enum OrderType {
 
 export enum OrderStatus {
   PENDING = 'pending',
+  EXECUTING = 'executing', // Для ордеров в процессе исполнения
   FILLED = 'filled',
   CANCELLED = 'cancelled',
   EXPIRED = 'expired',
   ERROR = 'error',
+  INACTIVE = 'inactive', // Для take profit ордеров, которые еще не активированы
 }
 
 export interface LimitOrderParams {
@@ -25,6 +27,7 @@ export interface LimitOrderParams {
   slippage?: number;
   takeProfitPercent?: number; // автоматический take profit
   stopLossPercent?: number; // автоматический stop loss
+  linkedPositionId?: string; // ID связанной позиции (для TP/SL ордеров)
 }
 
 export interface LimitOrder {
@@ -32,15 +35,36 @@ export interface LimitOrder {
   params: LimitOrderParams;
   status: OrderStatus;
   createdAt: number;
+  updatedAt?: number; // Время последнего обновления ордера
   filledAt?: number;
   filledAmount?: number;
   filledPrice?: number;
   txSignature?: string;
-  relatedOrderId?: string; // для take profit / stop loss
+  signature?: string; // Псевдоним для txSignature (для совместимости с базой данных)
+  relatedOrderId?: string; // для take profit / stop loss (deprecated, используйте linkedBuyOrderId/linkedTakeProfitOrderId)
+  linkedBuyOrderId?: string; // ID связанного buy ордера (для take profit)
+  linkedTakeProfitOrderId?: string; // ID связанного take profit ордера (для buy)
+  linkedPositionId?: string; // ID связанной позиции (для TP/SL ордеров)
   errorMessage?: string; // текст ошибки при статусе ERROR
+  error?: string; // Псевдоним для errorMessage (для совместимости с базой данных)
+  currentPrice?: number; // Текущая цена токена (для мониторинга)
+  tokenType?: 'DEX_POOL' | 'BONDING_CURVE'; // Тип токена (для выбора стратегии)
+  takeProfitPercent?: number; // Процент take profit (для take profit ордеров)
+  jitoTip?: number; // Размер Jito tip в lamports
+  retryCount?: number; // Количество попыток повтора
+  lastRetryAt?: number; // Время последней попытки повтора
 }
 
 export type OrderFilledCallback = (order: LimitOrder) => Promise<void>;
+export type OrderCancelledCallback = (order: LimitOrder) => Promise<void>;
+
+/**
+ * Связка ордеров (buy limit + take profit)
+ */
+export interface LinkedOrderPair {
+  buyOrderId: string;
+  takeProfitOrderId?: string;
+}
 
 export interface ILimitOrderManager {
   name: string;
@@ -99,12 +123,5 @@ export interface ILimitOrderManager {
   /**
    * Получить статистику ордеров
    */
-  getStats(): Promise<{
-    total: number;
-    pending: number;
-    filled: number;
-    cancelled: number;
-    expired: number;
-    error: number;
-  }>;
+  getStats(): Promise<Record<OrderStatus | 'total', number>>;
 }

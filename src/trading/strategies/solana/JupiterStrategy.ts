@@ -4,6 +4,8 @@ import { SolanaProvider } from '../../../chains/SolanaProvider';
 import { STRATEGY_PRIORITY } from '../../../config/constants';
 import { JitoBundle } from '../../../utils/JitoBundle';
 import { createJupiterApiClient } from '@jup-ag/api';
+import { ITransactionSubmitter, SimulationResult } from '../../../interfaces/ITransactionSubmitter';
+import { JitoTipCalculator } from '../../../utils/JitoTipCalculator';
 
 // Расширенный интерфейс UserSettings с Jito опциями
 interface ExtendedUserSettings extends UserSettings {
@@ -26,11 +28,11 @@ export class JupiterStrategy implements ITradingStrategy {
   private jupiterApi: any;
   private jitoBundle: JitoBundle;
 
-  constructor(chainProvider: SolanaProvider, wallet: Keypair) {
+  constructor(chainProvider: SolanaProvider, wallet: Keypair, jitoAuthKeypair: Keypair | null = null) {
     this.chainProvider = chainProvider;
     this.wallet = wallet;
     this.jupiterApi = createJupiterApiClient();
-    this.jitoBundle = new JitoBundle(chainProvider.connection);
+    this.jitoBundle = new JitoBundle(chainProvider.connection, jitoAuthKeypair);
   }
 
   async canTrade(tokenMint: string): Promise<boolean> {
@@ -130,24 +132,41 @@ export class JupiterStrategy implements ITradingStrategy {
         Buffer.from(swapResponse.swapTransaction, 'base64')
       );
 
-      // Подписываем транзакцию
-      transaction.sign(this.wallet);
-
       // Отправляем транзакцию
       if (extendedSettings.useJito && settings.mevProtection) {
         console.log(`   🛡️ Sending with Jito MEV protection...`);
         
-        // Рассчитываем Jito tip
-        const jitoTip = this.calculateJitoTip(params.amount, extendedSettings.jitoTipMultiplier || 1.0);
+        // Рассчитываем Jito tip используя централизованный калькулятор с учетом network congestion
+        const jitoTip = await JitoTipCalculator.calculateOptimalTipWithCongestion(
+          params.amount,
+          this.chainProvider.connection,
+          {
+            isBondingCurve: false, // Jupiter = DEX
+            isVolatile: false, // DEX обычно менее волатильны
+            customMultiplier: extendedSettings.jitoTipMultiplier || 1.0
+          }
+        );
         
-        const signature = await this.jitoBundle.sendBundle([transaction], {
-          tipLamports: jitoTip,
-        });
+        // НЕ подписываем здесь - JitoBundle сделает это
+        const signature = await this.jitoBundle.sendBundle(
+          [transaction],
+          { tipLamports: jitoTip },
+          this.wallet // Передаем signer
+        );
+        
+        // Логируем Jito метрики
+        console.log(`   📊 Jito metrics:`);
+        console.log(`      Tip paid: ${jitoTip} lamports (${(jitoTip / LAMPORTS_PER_SOL).toFixed(8)} SOL)`);
+        console.log(`      Trade amount: ${params.amount} lamports`);
+        console.log(`      Tip ratio: ${((jitoTip / params.amount) * 100).toFixed(4)}%`);
         
         console.log(`   ✅ Transaction sent via Jito: ${signature.slice(0, 8)}...`);
         return signature;
       } else {
         console.log(`   📤 Sending transaction without Jito (MEV protection: ${settings.mevProtection})`);
+        
+        // Для standard RPC подписываем здесь
+        transaction.sign(this.wallet);
         const signature = await this.chainProvider.sendTransaction(transaction);
         console.log(`   ✅ Transaction sent: ${signature.slice(0, 8)}...`);
         return signature;
@@ -163,6 +182,91 @@ export class JupiterStrategy implements ITradingStrategy {
   }
 
   /**
+   * Построить swap транзакцию (без отправки)
+   * Используется для market orders
+   */
+  async buildTransaction(params: SwapParams): Promise<Transaction> {
+    try {
+      console.log(`   🔨 Building Jupiter swap transaction...`);
+
+      // Получаем котировку
+      const quoteResponse = await this.jupiterApi.quoteGet({
+        inputMint: params.tokenIn,
+        outputMint: params.tokenOut,
+        amount: params.amount.toString(),
+        slippageBps: Math.floor(params.slippage * 100),
+        onlyDirectRoutes: false,
+        asLegacyTransaction: false,
+        prioritizationFeeLamports: await this.chainProvider.getOptimalFee(params.tokenOut),
+      });
+
+      if (!quoteResponse) {
+        throw new Error('No quote available from Jupiter');
+      }
+
+      // Получаем swap транзакцию
+      const swapResponse = await this.jupiterApi.swapPost({
+        swapRequest: {
+          quoteResponse,
+          userPublicKey: this.wallet.publicKey.toBase58(),
+          wrapAndUnwrapSol: true,
+          dynamicComputeUnitLimit: true,
+          prioritizationFeeLamports: await this.chainProvider.getOptimalFee(params.tokenOut),
+        },
+      });
+
+      if (!swapResponse || !swapResponse.swapTransaction) {
+        throw new Error('Failed to create swap transaction');
+      }
+
+      // Десериализуем транзакцию
+      const transaction = Transaction.from(
+        Buffer.from(swapResponse.swapTransaction, 'base64')
+      );
+
+      console.log(`   ✅ Transaction built successfully`);
+
+      return transaction;
+    } catch (error) {
+      console.error(`   ❌ Error building Jupiter transaction:`, error);
+      throw new Error(`Failed to build Jupiter transaction: ${error}`);
+    }
+  }
+
+  /**
+   * Симулировать транзакцию
+   */
+  async simulateTransaction(transaction: Transaction): Promise<SimulationResult> {
+    try {
+      console.log(`   🔍 Simulating Jupiter transaction...`);
+
+      const connection = this.chainProvider.connection;
+      const simulation = await connection.simulateTransaction(transaction, [this.wallet]);
+
+      if (simulation.value.err) {
+        return {
+          success: false,
+          error: JSON.stringify(simulation.value.err),
+          logs: simulation.value.logs || undefined
+        };
+      }
+
+      console.log(`   ✅ Simulation successful`);
+
+      return {
+        success: true,
+        logs: simulation.value.logs || undefined
+      };
+    } catch (error) {
+      console.error(`   ❌ Simulation failed:`, error);
+      return {
+        success: false,
+        error: String(error)
+      };
+    }
+  }
+
+  /**
    * Рассчитать комиссию Jupiter
    */
   private calculateJupiterFee(quoteResponse: any): number {
@@ -170,23 +274,6 @@ export class JupiterStrategy implements ITradingStrategy {
     // Это приблизительный расчет
     const feeAmount = Number(quoteResponse.inAmount) * 0.0025;
     return Math.floor(feeAmount);
-  }
-
-  /**
-   * Рассчитать динамический Jito tip на основе размера сделки
-   */
-  private calculateJitoTip(amountInLamports: number, multiplier: number = 1.0): number {
-    // Базовый tip: 0.00001 SOL (10,000 lamports)
-    const baseTip = 10_000;
-    
-    // Динамический tip: 0.05% от суммы сделки
-    const dynamicTip = Math.floor(amountInLamports * 0.0005);
-    
-    // Используем максимум из базового и динамического
-    const tip = Math.max(baseTip, dynamicTip);
-    
-    // Применяем множитель
-    return Math.floor(tip * multiplier);
   }
 
   /**

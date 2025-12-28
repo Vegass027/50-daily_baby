@@ -15,7 +15,7 @@ export class DisplayHelper {
   }
 
   static formatTokenAmount(amount: number, decimals: number, symbol?: string): string {
-    const formatted = (amount / Math.pow(10, decimals)).toFixed(4);
+    const formatted = (amount / Math.pow(10, decimals)).toFixed(decimals);
     return symbol ? `${formatted} ${symbol}` : formatted;
   }
 
@@ -45,6 +45,9 @@ export class DisplayHelper {
   }
 
   static formatSignature(signature: string): string {
+    if (signature.length <= 16) {
+      return signature;
+    }
     return `${signature.slice(0, 8)}...${signature.slice(-8)}`;
   }
 

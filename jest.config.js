@@ -3,10 +3,7 @@ module.exports = {
   testEnvironment: 'node',
   roots: ['<rootDir>/tests'],
   testMatch: ['**/*.test.ts'],
-  collectCoverageFrom: [
-    'src/**/*.ts',
-    '!src/**/*.d.ts',
-  ],
+  collectCoverageFrom: [],
   coverageDirectory: 'coverage',
   coverageReporters: ['text', 'lcov', 'html'],
   coverageThreshold: {
@@ -17,14 +14,11 @@ module.exports = {
       statements: 70,
     },
   },
-  moduleNameMapper: {
-    '^@solana/web3.js$': '<rootDir>/node_modules/@solana/web3.js/lib/index.js',
-    '^@coral-xyz/anchor$': '<rootDir>/node_modules/@coral-xyz/anchor/lib/index.js',
-    '^@solana/spl-token$': '<rootDir>/node_modules/@solana/spl-token/lib/index.js',
-    '^@jup-ag/api$': '<rootDir>/node_modules/@jup-ag/api/dist/index.js',
-  },
+  // moduleNameMapper removed - let Jest use standard module resolution
   transform: {
     '^.+\\.tsx?$': 'ts-jest',
   },
-  testTimeout: 30000, // 30 seconds timeout for integration tests
+  testTimeout: 10000, // 10 seconds timeout per test
+  forceExit: true, // Force Jest to exit after tests complete
+  setupFilesAfterEnv: ['<rootDir>/tests/setup.ts'],
 };

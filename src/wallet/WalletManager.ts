@@ -3,6 +3,7 @@ import * as crypto from 'crypto';
 import dotenv from 'dotenv';
 import bs58 from 'bs58';
 import { prisma } from '../services/PrismaClient';
+import { WalletBackupService } from '../services/WalletBackupService';
 
 dotenv.config();
 
@@ -20,7 +21,15 @@ class SecureWalletStorage {
     }
 
     private getKey(): Buffer {
-        return crypto.createHash('sha256').update(this.masterPassword!).digest();
+        // Используем PBKDF2 для безопасного вывода ключа (100k итераций)
+        const salt = Buffer.from('SOL_BOT_WALLET_SALT_V1', 'utf-8');
+        return crypto.pbkdf2Sync(
+            this.masterPassword!,
+            salt,
+            100000,  // 100k итераций для защиты от brute-force
+            32,      // 32 байта для AES-256
+            'sha512'
+        );
     }
 
     encrypt(text: string): string {
@@ -46,10 +55,21 @@ class SecureWalletStorage {
 export class WalletManager {
     private storage: SecureWalletStorage;
     private connection: Connection;
+    private backupService: WalletBackupService | null = null;
 
     constructor(rpcUrl: string) {
         this.storage = new SecureWalletStorage();
         this.connection = new Connection(rpcUrl, 'confirmed');
+        
+        // Инициализируем сервис бэкапов если настроены переменные окружения
+        try {
+            if (process.env.BACKUP_ENCRYPTION_KEY) {
+                this.backupService = new WalletBackupService();
+                console.log('✅ WalletBackupService initialized');
+            }
+        } catch (error) {
+            console.warn('⚠️ WalletBackupService not initialized:', (error as Error).message);
+        }
     }
 
     private async saveWalletToDB(publicKey: PublicKey, encryptedPrivateKey: string): Promise<void> {
@@ -93,22 +113,42 @@ export class WalletManager {
         }
     }
     
-    async createWallet(): Promise<PublicKey> {
+    async createWallet(userId?: number): Promise<PublicKey> {
         const keypair = Keypair.generate();
         const privateKeyBs58 = bs58.encode(keypair.secretKey);
         const encryptedPrivateKey = this.storage.encrypt(privateKeyBs58);
         
         await this.saveWalletToDB(keypair.publicKey, encryptedPrivateKey);
         
+        // Создаем бэкап если сервис доступен и указан userId
+        if (this.backupService && userId) {
+            try {
+                await this.backupService.backupWallet(userId, encryptedPrivateKey);
+            } catch (error) {
+                console.error('Failed to create wallet backup:', error);
+                // Не прерываем основной процесс при ошибке бэкапа
+            }
+        }
+        
         return keypair.publicKey;
     }
 
-    async importWallet(privateKeyBs58: string): Promise<PublicKey> {
+    async importWallet(privateKeyBs58: string, userId?: number): Promise<PublicKey> {
         const secretKey = bs58.decode(privateKeyBs58);
         const keypair = Keypair.fromSecretKey(secretKey);
         const encryptedPrivateKey = this.storage.encrypt(privateKeyBs58);
         
         await this.saveWalletToDB(keypair.publicKey, encryptedPrivateKey);
+
+        // Создаем бэкап если сервис доступен и указан userId
+        if (this.backupService && userId) {
+            try {
+                await this.backupService.backupWallet(userId, encryptedPrivateKey);
+            } catch (error) {
+                console.error('Failed to create wallet backup:', error);
+                // Не прерываем основной процесс при ошибке бэкапа
+            }
+        }
 
         return keypair.publicKey;
     }

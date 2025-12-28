@@ -22,6 +22,8 @@ export class AutoRefreshService {
   private readonly REFRESH_INTERVAL: number = 5000; // 5 секунд
   private useRealtime: boolean = true; // Флаг использования Realtime
   private realtimeConnected: boolean = false;
+  private fallbackInterval: NodeJS.Timeout | null = null;
+  private healthMonitorInterval: NodeJS.Timeout | null = null;
 
   constructor(
     bot: Telegraf,
@@ -133,10 +135,15 @@ export class AutoRefreshService {
    * Запуск fallback polling
    */
   private startFallbackPolling(): void {
+    // Очистить существующий interval если есть
+    if (this.fallbackInterval) {
+      clearInterval(this.fallbackInterval);
+    }
+    
     // Polling каждые 10 секунд с Realtime, 5 секунд без Realtime
     const FALLBACK_INTERVAL = this.useRealtime ? 10000 : 5000;
     
-    setInterval(async () => {
+    this.fallbackInterval = setInterval(async () => {
       if (!this.realtimeConnected && this.useRealtime) {
         console.warn('[AutoRefreshService] Realtime disconnected, using polling');
       }
@@ -192,6 +199,15 @@ export class AutoRefreshService {
       if (!state || state.closed) {
         // Панель закрыта или не существует, останавливаем авто-обновление
         this.stopAutoRefresh(userId);
+        
+        // Удаляем состояние из базы данных ТОЛЬКО если панель закрыта пользователем
+        // Не удаляем если просто не найдено сообщение (авто-обновление может временно не находить сообщение)
+        if (state && state.closed) {
+          await this.stateManager.deleteState(userId);
+          console.log(`[AutoRefreshService] Deleted closed state for user ${userId}`);
+        } else if (!state) {
+          console.log(`[AutoRefreshService] State not found for user ${userId}, skipping deletion`);
+        }
         return;
       }
 
@@ -323,7 +339,12 @@ export class AutoRefreshService {
    * Мониторинг здоровья Realtime соединения
    */
   private monitorRealtimeHealth(): void {
-    setInterval(() => {
+    // Очистить существующий interval если есть
+    if (this.healthMonitorInterval) {
+      clearInterval(this.healthMonitorInterval);
+    }
+    
+    this.healthMonitorInterval = setInterval(() => {
       const channelsCount = realtimeService.getActiveChannelsCount();
       console.log(`[Realtime] Active channels: ${channelsCount}`);
       
@@ -338,10 +359,22 @@ export class AutoRefreshService {
    * Остановить все авто-обновления
    */
   stopAll(): void {
+    // Очистка user intervals
     for (const [userId] of this.refreshIntervals.entries()) {
       this.stopAutoRefresh(userId);
     }
-    console.log('[AutoRefreshService] Stopped all auto-refresh intervals');
+    
+    // Очистка глобальных intervals
+    if (this.fallbackInterval) {
+      clearInterval(this.fallbackInterval);
+      this.fallbackInterval = null;
+    }
+    if (this.healthMonitorInterval) {
+      clearInterval(this.healthMonitorInterval);
+      this.healthMonitorInterval = null;
+    }
+    
+    console.log('[AutoRefreshService] Stopped all intervals');
   }
 
   /**
