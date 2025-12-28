@@ -1,0 +1,47 @@
+# Node modules
+node_modules
+npm-debug.log
+yarn-error.log
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build output
+dist
+
+# Prisma (кроме schema.prisma и dev.db)
+prisma/migrations
+!prisma/schema.prisma
+!prisma/dev.db
+
+# Data
+data/
+
+# Logs
+logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+README.md
+docs/
+plans/
+.kilocode/
+
+# Test files
+tests/
+*.test.ts
+*.spec.ts
