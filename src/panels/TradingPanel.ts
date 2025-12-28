@@ -1,6 +1,6 @@
 import { Telegraf, Context } from 'telegraf';
 import { InlineKeyboardButton } from 'telegraf/types';
-import { prisma } from '../services/PrismaClient';
+import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { TradeRouter } from '../trading/router/TradeRouter';
 import { ILimitOrderManager, LimitOrderParams, OrderType } from '../trading/managers/ILimitOrderManager';
 import { UserSettings } from '../trading/router/ITradingStrategy';
@@ -10,19 +10,23 @@ import { TokenDataFetcher } from '../services/TokenDataFetcher';
 import { PositionTracker } from '../services/PositionTracker';
 import { TPSLManager } from '../services/TPSLManager';
 import { AutoRefreshService } from '../services/AutoRefreshService';
-import { 
-  UserPanelState, 
-  PanelMode, 
-  TokenData, 
-  UserData, 
-  ActionData, 
-  PositionData 
+import { SolanaProvider } from '../chains/SolanaProvider';
+import realtimeService from '../services/RealtimeService';
+import {
+  UserPanelState,
+  PanelMode,
+  TokenData,
+  UserData,
+  ActionData,
+  PositionData
 } from '../types/panel';
 
 /**
  * Переработанная торговая панель с единым контекстом токена
  */
 export class TradingPanel {
+  private lastTradeTime: Map<number, number> = new Map();
+  private readonly TRADE_COOLDOWN = 3000; // 3 секунды
   private bot: Telegraf;
   private tradeRouter: TradeRouter;
   private limitOrderManager: ILimitOrderManager;
@@ -33,6 +37,7 @@ export class TradingPanel {
   private positionTracker: PositionTracker;
   private tpslManager: TPSLManager;
   private autoRefreshService: AutoRefreshService | null;
+  private solanaProvider: SolanaProvider;
 
   constructor(
     bot: Telegraf,
@@ -44,7 +49,8 @@ export class TradingPanel {
     tokenDataFetcher: TokenDataFetcher,
     positionTracker: PositionTracker,
     tpslManager: TPSLManager,
-    autoRefreshService: AutoRefreshService
+    autoRefreshService: AutoRefreshService | null,
+    solanaProvider: SolanaProvider
   ) {
     this.bot = bot;
     this.tradeRouter = tradeRouter;
@@ -56,6 +62,7 @@ export class TradingPanel {
     this.positionTracker = positionTracker;
     this.tpslManager = tpslManager;
     this.autoRefreshService = autoRefreshService;
+    this.solanaProvider = solanaProvider;
   }
 
   /**
@@ -70,8 +77,11 @@ export class TradingPanel {
    */
   generatePanelText(state: UserPanelState): string {
     const { token_data, user_data, mode, action_data } = state;
+    
+    // Индикатор Realtime соединения
+    const realtimeStatus = realtimeService.isConnected() ? '🟢 Live' : '🟡 Polling';
 
-    let text = `🪙 ${token_data.name} (${token_data.ticker})\n`;
+    let text = `🪙 ${token_data.name} (${token_data.ticker}) ${realtimeStatus}\n`;
     text += `📝 \`${state.token_address.slice(0, 8)}...${state.token_address.slice(-8)}\`\n`;
     text += `━━━━━━━━━━━━━━━━\n\n`;
     text += `📊 Market Cap: $${this.formatNumber(token_data.market_cap)}\n`;
@@ -280,9 +290,9 @@ export class TradingPanel {
           break;
         case 'execute':
           if (params[0] === 'buy') {
-            await this.executeBuy(ctx, state);
+            await this.executeBuy(state);
           } else if (params[0] === 'sell') {
-            await this.executeSell(ctx, state);
+            await this.executeSell(state);
           }
           break;
         case 'limit':
@@ -531,14 +541,44 @@ export class TradingPanel {
   }
 
   private async executeBuy(state: UserPanelState): Promise<void> {
-    const { token_address, action_data } = state;
+    this.checkRateLimit(state.user_id);
+    const { token_address, action_data, user_data } = state;
     
+    // Валидация суммы
+    if (action_data.selected_amount <= 0) {
+      throw new Error('Amount must be positive');
+    }
+    
+    // Проверка баланса
+    const requiredUSD = action_data.selected_amount;
+    if (requiredUSD > user_data.usd_balance) {
+      throw new Error(
+        `Insufficient balance. Required: $${requiredUSD}, Available: $${user_data.usd_balance.toFixed(2)}`
+      );
+    }
+    
+    // 1. Получить текущую цену SOL в USD (с fallback)
+    const solPriceUSD = await this.tokenDataFetcher.getSOLPriceInUSD() || 150;
+    
+    // 2. Конвертировать USD в SOL
+    const amountUSD = action_data.selected_amount;
+    const amountSOL = amountUSD / solPriceUSD;
+    const amountLamports = Math.floor(amountSOL * LAMPORTS_PER_SOL);
+    
+    console.log(`[TradingPanel] Buying for $${amountUSD} (${amountSOL.toFixed(4)} SOL) at rate ${solPriceUSD}`);
+    
+    // 3. Валидация баланса
     const wallet = await this.walletManager.getWallet();
     if (!wallet) {
       throw new Error('Wallet not found');
     }
     
-    const amountLamports = action_data.selected_amount * 1_000_000_000;
+    const userBalance = await this.solanaProvider.getBalance(wallet.publicKey.toString());
+    if (amountLamports > userBalance) {
+      throw new Error(`Insufficient balance. Required: ${amountSOL.toFixed(4)} SOL, Available: ${(userBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+    }
+    
+    // 4. Выполнить покупку
     const result = await this.tradeRouter.buy(
       'Solana',
       token_address,
@@ -548,32 +588,58 @@ export class TradingPanel {
     );
     
     const txSignature = result.signature;
-    const price = state.token_data.current_price; // Это примерная цена, лучше получать ее из результата сделки
-    const amountTokens = (result.outputAmount || 0) / Math.pow(10, state.token_data.decimals || 9);
+    const price = state.token_data.current_price;
+    const amountTokens = result.outputAmount / Math.pow(10, state.token_data.decimals || 9);
 
-    await this.positionTracker.recordTrade(state.user_id, token_address, 'BUY', price, amountTokens);
+    // 5. Записать позицию
+    const updatedPosition = await this.positionTracker.recordTrade(state.user_id, token_address, 'BUY', price, amountTokens);
 
-    if (action_data.tp_enabled || action_data.sl_enabled) {
-      const position = await prisma.position.findUnique({
-          where: { userId_tokenAddress: { userId: BigInt(state.user_id), tokenAddress: token_address } },
-      });
-      if (position) {
-          await this.tpslManager.createTPSLOrders(
-              position.id,
-              token_address,
-              price,
-              amountTokens,
-              action_data.tp_percent,
-              action_data.sl_percent
-          );
+    // 6. Обновить баланс пользователя
+    const newBalance = await this.solanaProvider.getBalance(wallet.publicKey.toString());
+    const newBalanceSOL = newBalance / LAMPORTS_PER_SOL;
+    const newBalanceUSD = newBalanceSOL * solPriceUSD;
+    
+    state.user_data.sol_balance = newBalanceSOL;
+    state.user_data.usd_balance = newBalanceUSD;
+
+    // 7. Обновить позицию в состоянии
+    const currentPrice = await this.tokenDataFetcher.getCurrentPrice(token_address);
+    if (currentPrice) {
+      const positionData = await this.positionTracker.getPosition(state.user_id, token_address);
+      if (positionData) {
+        const pnl = this.positionTracker.calculatePNL(positionData, currentPrice);
+        state.action_data.position = {
+          ...positionData,
+          current_price: currentPrice,
+          pnl_usd: pnl.pnl_usd,
+          pnl_percent: pnl.pnl_percent,
+        };
       }
     }
 
-    console.log(`[TradingPanel] Buy executed: ${amountTokens} ${token_address} at ${price} SOL`);
+    // 8. Создать TP/SL если включены
+    if (action_data.tp_enabled || action_data.sl_enabled) {
+      try {
+        await this.tpslManager.createTPSLOrders(updatedPosition, {
+          tpPercent: action_data.tp_percent,
+          slPercent: action_data.sl_percent
+        });
+      } catch (error) {
+        console.error('[TradingPanel] Failed to create TP/SL:', error);
+        // Уведомить пользователя об ошибке
+        await this.bot.telegram.sendMessage(
+          Number(state.user_id),
+          '⚠️ Warning: Failed to create TP/SL orders. Your position was opened but risk management is not active.'
+        );
+      }
+    }
+
+    console.log(`[TradingPanel] Buy executed: ${amountTokens.toFixed(4)} tokens at ${price} SOL`);
   }
 
   private async executeSell(state: UserPanelState): Promise<void> {
-    const { token_address, action_data } = state;
+    this.checkRateLimit(state.user_id);
+    const { token_address, action_data, user_id, token_data } = state;
 
     if (!action_data.position) {
       throw new Error('No position to sell');
@@ -584,81 +650,135 @@ export class TradingPanel {
       throw new Error('Wallet not found');
     }
 
-    const amountLamports = action_data.selected_amount;
+    // 1. Получить актуальную позицию
+    const position = await this.positionTracker.getPosition(user_id, token_address);
+    if (!position || position.size <= 0) {
+      throw new Error('No active position found to sell.');
+    }
+
+    // 2. Валидация процента продажи
+    if (action_data.selected_amount <= 0 || action_data.selected_amount > 100) {
+      throw new Error('Invalid sell percentage. Must be between 0 and 100.');
+    }
+
+    // 3. Рассчитать количество токенов для продажи в их основной единице (не lamports)
+    const amountToSellInTokenUnits = position.size * (action_data.selected_amount / 100);
+    
+    // 4. Проверить, что есть что продавать
+    if (amountToSellInTokenUnits <= 0) {
+      throw new Error('Nothing to sell.');
+    }
+
+    // 3. Конвертировать в базовые единицы (как lamports для токена)
+    const amountToSellInBaseUnits = Math.floor(amountToSellInTokenUnits * Math.pow(10, token_data.decimals || 9));
+
+    if (amountToSellInBaseUnits <= 0) {
+        throw new Error("Calculated amount to sell is zero.");
+    }
+
+    // 4. Выполнить продажу с корректным количеством
     const result = await this.tradeRouter.sell(
       'Solana',
       token_address,
-      amountLamports,
+      amountToSellInBaseUnits,
       this.userSettings,
       wallet
     );
 
     const txSignature = result.signature;
+    const receivedSol = result.outputAmount / LAMPORTS_PER_SOL; // Получаем SOL из результата
 
-    // selected_amount - это процент (e.g., 50 для 50%)
-    const position = await this.positionTracker.getPosition(state.user_id, state.token_address);
-    if (!position) throw new Error('No position to sell');
-    const amountToSell = position.size * (action_data.selected_amount / 100);
-
-    await this.positionTracker.recordTrade(
-        state.user_id,
-        state.token_address,
+    // 5. Записать сделку
+    const updatedPosition = await this.positionTracker.recordTrade(
+        user_id,
+        token_address,
         'SELL',
-        state.token_data.current_price,
-        amountToSell
+        token_data.current_price,
+        amountToSellInTokenUnits // Записываем количество в токенах
     );
 
-    const dbPosition = await prisma.position.findUnique({ where: { userId_tokenAddress: { userId: BigInt(state.user_id), tokenAddress: state.token_address }}});
-    if (dbPosition) {
-        await this.tpslManager.cancelRelatedOrders(dbPosition.id);
+    console.log(`[TradingPanel] Sell executed for ${action_data.selected_amount}% of position (${amountToSellInTokenUnits.toFixed(4)} tokens). Received ~${receivedSol.toFixed(6)} SOL. Tx: ${txSignature}`);
+    if (updatedPosition.size === 0) {
+        console.log(`[TradingPanel] Position for ${token_address} closed.`);
+        await this.tpslManager.cancelRelatedOrders(updatedPosition.id);
     }
 
-    console.log(`[TradingPanel] Sell executed: ${action_data.selected_amount} ${token_address}`);
+    // Обновить баланс
+    const solPriceUSD = await this.tokenDataFetcher.getSOLPriceInUSD() || 150;
+    const newBalance = await this.solanaProvider.getBalance(wallet.publicKey.toString());
+    const newBalanceSOL = newBalance / LAMPORTS_PER_SOL;
+    
+    state.user_data.sol_balance = newBalanceSOL;
+    state.user_data.usd_balance = newBalanceSOL * solPriceUSD;
+    
+    // Обновить позицию в состоянии
+    const positionData = await this.positionTracker.getPosition(state.user_id, token_address);
+    if (positionData && positionData.size > 0) {
+      const currentPrice = await this.tokenDataFetcher.getCurrentPrice(token_address);
+      if (currentPrice) {
+        const pnl = this.positionTracker.calculatePNL(positionData, currentPrice);
+        state.action_data.position = {
+          ...positionData,
+          current_price: currentPrice,
+          pnl_usd: pnl.pnl_usd,
+          pnl_percent: pnl.pnl_percent,
+        };
+      }
+    } else {
+      state.action_data.position = undefined;
+    }
   }
 
   private async placeLimitOrder(state: UserPanelState): Promise<void> {
-    const { token_address, action_data } = state;
+    const { token_address, action_data, user_id } = state;
 
     if (!action_data.limit_price || !action_data.selected_amount) {
       throw new Error('Please set price and amount first');
     }
 
+    // Конвертация USD в lamports (action_data.selected_amount - это USD)
+    const solPriceUSD = await this.tokenDataFetcher.getSOLPriceInUSD() || 150;
+    
+    const amountUSD = action_data.selected_amount;
+    const amountSOL = amountUSD / solPriceUSD;
+    const amountLamports = Math.floor(amountSOL * LAMPORTS_PER_SOL);
+
     const params: LimitOrderParams = {
+      userId: user_id, // Передаем userId из состояния
       tokenMint: token_address,
       orderType: OrderType.BUY,
-      amount: action_data.selected_amount,
+      amount: amountLamports, // В lamports!
       price: action_data.limit_price,
       slippage: action_data.slippage,
     };
 
     const orderId = await this.limitOrderManager.createOrder(params);
 
-    if (action_data.tp_enabled || action_data.sl_enabled) {
-      // Эта логика должна быть пересмотрена. TP/SL для лимитных ордеров
-      // должны создаваться ПОСЛЕ их исполнения, а не при создании.
-      // Пока оставляем этот блок пустым или комментируем.
-      console.log('[TradingPanel] TP/SL for limit orders should be set after execution.');
-    }
-
+    // Сохраняем ID ордера в состоянии
     state.user_data.has_active_order = true;
+    state.activeLimitOrderId = orderId;
 
-    console.log(`[TradingPanel] Limit order placed: ${orderId}`);
+    console.log(`[TradingPanel] Limit order placed: ${orderId} for user ${user_id}`);
   }
 
   private async cancelLimitOrder(state: UserPanelState): Promise<void> {
-    // Логика отмены лимитного ордера
-    // const orderId = ... (нужно где-то хранить ID активного лимитного ордера)
-    // await this.limitOrderManager.cancelOrder(orderId);
+    const orderId = state.activeLimitOrderId;
     
-    // Отменяем связанные TP/SL, если они были ошибочно созданы
-    const dbPosition = await prisma.position.findUnique({ where: { userId_tokenAddress: { userId: BigInt(state.user_id), tokenAddress: state.token_address }}});
-    if (dbPosition) {
-        await this.tpslManager.cancelRelatedOrders(dbPosition.id);
+    if (!orderId) {
+      throw new Error("No active limit order to cancel");
     }
     
+    // Отменить ордер в блокчейне
+    await this.limitOrderManager.cancelOrder(orderId);
+    
+    // Отменить связанные TP/SL ордера
+    await this.tpslManager.cancelRelatedOrders(orderId);
+    
+    // Обновить состояние
     state.user_data.has_active_order = false;
-
-    console.log(`[TradingPanel] Limit order cancelled`);
+    state.activeLimitOrderId = undefined;
+    
+    console.log(`[TradingPanel] Limit order cancelled: ${orderId} for user ${state.user_id}`);
   }
 
   private async setTakeProfit(state: UserPanelState, price?: number, percent?: number): Promise<void> {
@@ -712,7 +832,7 @@ export class TradingPanel {
 
     try {
       await this.bot.telegram.editMessageText(
-        state.user_id,
+        Number(state.user_id),
         state.message_id,
         undefined,
         text,
@@ -727,6 +847,18 @@ export class TradingPanel {
             console.error('[TradingPanel] Error updating message:', error);
         }
     }
+  }
+
+  private checkRateLimit(userId: number): void {
+    const now = Date.now();
+    const lastTrade = this.lastTradeTime.get(userId) || 0;
+    
+    if (now - lastTrade < this.TRADE_COOLDOWN) {
+      const waitTime = Math.ceil((this.TRADE_COOLDOWN - (now - lastTrade)) / 1000);
+      throw new Error(`Please wait ${waitTime} seconds between trades`);
+    }
+    
+    this.lastTradeTime.set(userId, now);
   }
 
   private formatNumber(num: number): string {

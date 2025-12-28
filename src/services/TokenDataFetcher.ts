@@ -63,6 +63,8 @@ export class TokenDataFetcher {
   private tokenList: Map<string, TokenInfo> = new Map();
   private readonly WSOL_MINT = 'So11111111111111111111111111111111111111112';
   private readonly USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+  private solPriceCache: { price: number; timestamp: number } | null = null;
+  private readonly SOL_PRICE_CACHE_TTL = 60000; // 1 минута
 
   constructor(connection: Connection) {
     this.connection = connection;
@@ -296,7 +298,36 @@ export class TokenDataFetcher {
 }
 
   /**
-   * Получить цену SOL в USDC
+   * Получить цену SOL в USD (публичный метод с кэшированием)
+   * @returns цена SOL в USD или null
+   */
+  async getSOLPriceInUSD(): Promise<number | null> {
+    // Проверить кэш
+    if (this.solPriceCache &&
+        Date.now() - this.solPriceCache.timestamp < this.SOL_PRICE_CACHE_TTL) {
+      return this.solPriceCache.price;
+    }
+
+    try {
+      // Получить цену SOL через Jupiter API
+      const response = await axios.get('https://price.jup.ag/v4/price?ids=So11111111111111111111111111111111111111112');
+      const data = await response.data;
+      const solPrice = data.data['So11111111111111111111111111111111111111112']?.price;
+      
+      if (solPrice) {
+        this.solPriceCache = { price: solPrice, timestamp: Date.now() };
+        return solPrice;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('[TokenDataFetcher] Error fetching SOL price:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Получить цену SOL в USDC (внутренний метод)
    * @returns цена SOL в USDC
    */
   private async getSOLPriceInUSDC(): Promise<number> {

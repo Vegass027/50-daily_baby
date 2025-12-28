@@ -51,6 +51,7 @@ export interface UserPanelState {
   token_data: TokenData;
   user_data: UserData;
   action_data: ActionData;
+  activeLimitOrderId?: string; // ID активного лимитного ордера
   created_at: number;
   closed: boolean;
   waiting_for?: 'limit_price' | 'limit_amount' | 'tp_price' | 'sl_price' | 'buy_amount' | 'sell_amount';

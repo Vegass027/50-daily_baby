@@ -26,7 +26,7 @@ export class TradeRouter {
     amountInBaseUnits: number,
     settings: UserSettings,
     userWallet: any
-  ): Promise<{ signature: string; strategy: string }> {
+  ): Promise<{ signature: string; strategy: string; outputAmount: number }> {
     const strategies = this.strategiesByChain.get(chain);
     
     if (!strategies || strategies.length === 0) {
@@ -49,9 +49,18 @@ export class TradeRouter {
           userWallet,
         };
 
+        // 1. Получаем котировку для определения outputAmount
+        const quote = await strategy.getQuote(params);
+        if (!quote || !quote.outputAmount) {
+          console.warn(`   ⚠️ ${strategy.name} failed to provide a quote. Trying next strategy.`);
+          continue;
+        }
+
+        // 2. Выполняем обмен
         const signature = await strategy.executeSwap(params, settings);
         
-        return { signature, strategy: strategy.name };
+        // 3. Возвращаем расширенный результат
+        return { signature, strategy: strategy.name, outputAmount: quote.outputAmount };
       }
     }
 
@@ -64,7 +73,7 @@ export class TradeRouter {
     amountInBaseUnits: number,
     settings: UserSettings,
     userWallet: any
-  ): Promise<{ signature: string; strategy: string }> {
+  ): Promise<{ signature: string; strategy: string; outputAmount: number }> {
     const strategies = this.strategiesByChain.get(chain);
     
     if (!strategies) {
@@ -81,8 +90,18 @@ export class TradeRouter {
           userWallet,
         };
 
+        // 1. Получаем котировку для определения outputAmount
+        const quote = await strategy.getQuote(params);
+        if (!quote || !quote.outputAmount) {
+          console.warn(`   ⚠️ ${strategy.name} failed to provide a quote for sell. Trying next strategy.`);
+          continue;
+        }
+
+        // 2. Выполняем обмен
         const signature = await strategy.executeSwap(params, settings);
-        return { signature, strategy: strategy.name };
+
+        // 3. Возвращаем расширенный результат
+        return { signature, strategy: strategy.name, outputAmount: quote.outputAmount };
       }
     }
 

@@ -1,0 +1,9 @@
+{
+	"servers": {
+		"Jupiter": {
+			"url": "https://dev.jup.ag/mcp",
+			"type": "http"
+		}
+	},
+	"inputs": []
+}

@@ -4,9 +4,10 @@ import { Keypair } from '@solana/web3.js';
 import { 
   ILimitOrderManager, 
   LimitOrder, 
-  LimitOrderParams, 
-  OrderStatus, 
-  OrderType 
+  LimitOrderParams,
+  OrderStatus,
+  OrderType,
+  OrderFilledCallback
 } from './ILimitOrderManager';
 import { PumpFunStrategy } from '../strategies/solana/PumpFunStrategy';
 import { PriceMonitor } from './PriceMonitor';
@@ -29,6 +30,7 @@ export class PumpFunLimitOrderManager implements ILimitOrderManager {
   private ordersFile: string;
   private monitoringInterval: NodeJS.Timeout | null = null;
   private readonly MONITORING_INTERVAL = 30000; // 30 секунд
+  private orderFilledCallback: OrderFilledCallback | null = null;
 
   constructor(
     pumpFunStrategy: PumpFunStrategy,
@@ -62,6 +64,10 @@ export class PumpFunLimitOrderManager implements ILimitOrderManager {
     console.log(`   ✅ ${this.name} initialized (${this.orders.size} orders loaded)`);
   }
 
+  public setOrderFilledCallback(callback: OrderFilledCallback): void {
+    this.orderFilledCallback = callback;
+  }
+
   /**
    * Создать лимитный ордер
    */
@@ -81,61 +87,6 @@ export class PumpFunLimitOrderManager implements ILimitOrderManager {
     console.log(`   ✅ Limit order created: ${orderId}`);
     console.log(`      Type: ${params.orderType}, Amount: ${params.amount}, Price: ${params.price} SOL`);
     
-    // Если есть take profit, создаем связанный sell ордер
-    if (params.takeProfitPercent && params.orderType === OrderType.BUY) {
-      const takeProfitPrice = params.price * (1 + params.takeProfitPercent / 100);
-      const takeProfitParams: LimitOrderParams = {
-        ...params,
-        orderType: OrderType.SELL,
-        price: takeProfitPrice,
-        takeProfitPercent: undefined, // avoid recursion
-      };
-      
-      const takeProfitOrderId = this.generateOrderId();
-      const takeProfitOrder: LimitOrder = {
-        id: takeProfitOrderId,
-        params: takeProfitParams,
-        status: OrderStatus.PENDING,
-        createdAt: Date.now(),
-        relatedOrderId: orderId,
-      };
-      
-      this.orders.set(takeProfitOrderId, takeProfitOrder);
-      order.relatedOrderId = takeProfitOrderId;
-      
-      await this.saveOrders();
-      
-      console.log(`   ✅ Take profit order created: ${takeProfitOrderId} (price: ${takeProfitPrice} SOL)`);
-    }
-
-    // Если есть stop loss, создаем связанный sell ордер
-    if (params.stopLossPercent && params.orderType === OrderType.BUY) {
-      const stopLossPrice = params.price * (1 - params.stopLossPercent / 100);
-      const stopLossParams: LimitOrderParams = {
-        ...params,
-        orderType: OrderType.SELL,
-        price: stopLossPrice,
-        stopLossPercent: undefined, // avoid recursion
-      };
-      
-      const stopLossOrderId = this.generateOrderId();
-      const stopLossOrder: LimitOrder = {
-        id: stopLossOrderId,
-        params: stopLossParams,
-        status: OrderStatus.PENDING,
-        createdAt: Date.now(),
-        relatedOrderId: orderId,
-      };
-      
-      this.orders.set(stopLossOrderId, stopLossOrder);
-      // Примечание: ордер может иметь только один relatedOrderId, поэтому для stop loss
-      // мы используем другое поле или просто создаем отдельную связь
-      
-      await this.saveOrders();
-      
-      console.log(`   ✅ Stop loss order created: ${stopLossOrderId} (price: ${stopLossPrice} SOL)`);
-    }
-
     return orderId;
   }
 
@@ -271,6 +222,10 @@ export class PumpFunLimitOrderManager implements ILimitOrderManager {
       console.log(`   ✅ Order ${order.id} filled! TX: ${txSignature.slice(0, 8)}...`);
       
       await this.saveOrders();
+
+      if (this.orderFilledCallback) {
+        await this.orderFilledCallback(order);
+      }
     } catch (error) {
       console.error(`   ❌ Failed to execute order ${order.id}:`, error);
       order.status = OrderStatus.ERROR;

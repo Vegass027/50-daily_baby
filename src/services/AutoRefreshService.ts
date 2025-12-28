@@ -3,6 +3,10 @@ import { StateManager } from './StateManager';
 import { TokenDataFetcher } from './TokenDataFetcher';
 import { UserPanelState } from '../types/panel';
 import { TradingPanel } from '../panels/TradingPanel';
+import { WalletManager } from '../wallet/WalletManager';
+import { SolanaProvider } from '../chains/SolanaProvider';
+import { LAMPORTS_PER_SOL } from '@solana/web3.js';
+import realtimeService, { RealtimePayload } from './RealtimeService';
 
 /**
  * Сервис авто-обновления торговых панелей
@@ -13,18 +17,138 @@ export class AutoRefreshService {
   private tokenDataFetcher: TokenDataFetcher;
   private bot: Telegraf;
   private tradingPanel: TradingPanel;
+  private walletManager: WalletManager;
+  private solanaProvider: SolanaProvider;
   private readonly REFRESH_INTERVAL: number = 5000; // 5 секунд
+  private useRealtime: boolean = true; // Флаг использования Realtime
+  private realtimeConnected: boolean = false;
 
   constructor(
     bot: Telegraf,
     stateManager: StateManager,
     tokenDataFetcher: TokenDataFetcher,
-    tradingPanel: TradingPanel
+    tradingPanel: TradingPanel,
+    walletManager: WalletManager,
+    solanaProvider: SolanaProvider
   ) {
     this.bot = bot;
     this.stateManager = stateManager;
     this.tokenDataFetcher = tokenDataFetcher;
     this.tradingPanel = tradingPanel;
+    this.walletManager = walletManager;
+    this.solanaProvider = solanaProvider;
+  }
+
+  /**
+   * Инициализация сервиса
+   */
+  async initialize(): Promise<void> {
+    console.log('[AutoRefreshService] Initializing...');
+    
+    // Подключить Realtime subscriptions
+    if (this.useRealtime) {
+      await this.setupRealtimeSubscriptions();
+    }
+
+    // Запустить fallback polling (реже, как backup)
+    this.startFallbackPolling();
+    
+    // Запустить мониторинг Realtime health
+    this.monitorRealtimeHealth();
+  }
+
+  /**
+   * Настройка Realtime subscriptions
+   */
+  private async setupRealtimeSubscriptions(): Promise<void> {
+    try {
+      // Подписка на ордера
+      realtimeService.subscribeToOrders(async (payload) => {
+        this.realtimeConnected = true;
+        await this.handleOrderChange(payload);
+      });
+
+      // Подписка на позиции
+      realtimeService.subscribeToPositions(async (payload) => {
+        await this.handlePositionChange(payload);
+      });
+
+      // Подписка на сделки
+      realtimeService.subscribeToTrades(async (payload) => {
+        await this.handleTradeChange(payload);
+      });
+
+      console.log('[AutoRefreshService] Realtime subscriptions active');
+    } catch (error) {
+      console.error('[AutoRefreshService] Realtime setup failed:', error);
+      this.useRealtime = false; // Fallback to polling only
+    }
+  }
+
+  /**
+   * Обработка изменения ордера через Realtime
+   */
+  private async handleOrderChange(payload: RealtimePayload): Promise<void> {
+    console.log('[AutoRefreshService] Order changed via Realtime:', payload.eventType);
+    
+    // Обновить UI для всех активных панелей с ордерами
+    const allStates = await this.stateManager.getAllStates();
+    
+    for (const state of allStates) {
+      if (state.activeLimitOrderId) {
+        await this.refreshPanel(state.user_id);
+      }
+    }
+  }
+
+  /**
+   * Обработка изменения позиции через Realtime
+   */
+  private async handlePositionChange(payload: RealtimePayload): Promise<void> {
+    console.log('[AutoRefreshService] Position changed via Realtime:', payload.eventType);
+    
+    // Обновить UI для всех активных панелей с позициями
+    const allStates = await this.stateManager.getAllStates();
+    
+    for (const state of allStates) {
+      await this.refreshPanel(state.user_id);
+    }
+  }
+
+  /**
+   * Обработка новой сделки через Realtime
+   */
+  private async handleTradeChange(payload: RealtimePayload): Promise<void> {
+    console.log('[AutoRefreshService] New trade via Realtime');
+    
+    // Обновить UI для всех активных панелей
+    const allStates = await this.stateManager.getAllStates();
+    
+    for (const state of allStates) {
+      await this.refreshPanel(state.user_id);
+    }
+  }
+
+  /**
+   * Запуск fallback polling
+   */
+  private startFallbackPolling(): void {
+    // Polling каждые 10 секунд с Realtime, 5 секунд без Realtime
+    const FALLBACK_INTERVAL = this.useRealtime ? 10000 : 5000;
+    
+    setInterval(async () => {
+      if (!this.realtimeConnected && this.useRealtime) {
+        console.warn('[AutoRefreshService] Realtime disconnected, using polling');
+      }
+      
+      // Обновить только если Realtime не работает
+      if (!this.useRealtime || !this.realtimeConnected) {
+        const allStates = await this.stateManager.getAllStates();
+        for (const state of allStates) {
+          await this.refreshPanel(state.user_id);
+        }
+      }
+    }, FALLBACK_INTERVAL);
   }
 
   /**
@@ -79,6 +203,25 @@ export class AutoRefreshService {
         state.token_data = updatedTokenData;
       }
 
+      // Обновляем баланс пользователя
+      try {
+        const wallet = await this.walletManager.getWallet();
+        if (wallet) {
+          const solBalance = await this.solanaProvider.getBalance(wallet.publicKey.toString());
+          const solBalanceSOL = solBalance / LAMPORTS_PER_SOL;
+          
+          const solPriceUSD = await this.tokenDataFetcher.getSOLPriceInUSD() || 150;
+          const usdBalance = solBalanceSOL * solPriceUSD;
+          
+          await this.stateManager.updateUserData(userId, {
+            sol_balance: solBalanceSOL,
+            usd_balance: usdBalance,
+          });
+        }
+      } catch (error) {
+        console.error('[AutoRefreshService] Error updating balance:', error);
+      }
+
       // Обновляем состояние с новыми данными
       const updatedState = await this.stateManager.getState(userId);
       
@@ -94,7 +237,7 @@ export class AutoRefreshService {
       // Обновляем сообщение в Telegram
       try {
         await this.bot.telegram.editMessageText(
-          userId,
+          Number(userId),
           updatedState.message_id,
           undefined,
           newText,
@@ -137,7 +280,7 @@ export class AutoRefreshService {
           // Проверяем, существует ли сообщение в Telegram
           try {
             await this.bot.telegram.editMessageText(
-              state.user_id,
+              Number(state.user_id),
               state.message_id,
               undefined,
               this.tradingPanel.generatePanelText(state),
@@ -174,6 +317,21 @@ export class AutoRefreshService {
     } catch (error) {
       console.error('[AutoRefreshService] Error in restoreAllPanels:', error);
     }
+  }
+
+  /**
+   * Мониторинг здоровья Realtime соединения
+   */
+  private monitorRealtimeHealth(): void {
+    setInterval(() => {
+      const channelsCount = realtimeService.getActiveChannelsCount();
+      console.log(`[Realtime] Active channels: ${channelsCount}`);
+      
+      // Alert если слишком много connections
+      if (channelsCount > 10) {
+        console.warn('[Realtime] Too many channels! Check for leaks.');
+      }
+    }, 60000); // Каждую минуту
   }
 
   /**

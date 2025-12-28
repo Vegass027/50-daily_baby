@@ -6,29 +6,29 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
-  url      = env("DATABASE_URL")
+  provider = "postgresql"
 }
 
 // Модель для хранения состояния торговой панели пользователя
 model UserPanelState {
-  userId       BigInt    @id
-  messageId    BigInt
-  tokenAddress String
-  mode         PanelMode
-  tokenData    Json
-  userData     Json
-  actionData   Json
-  waitingFor   String?
-  closed       Boolean   @default(false)
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  userId              BigInt    @id  // BigInt для Telegram IDs
+  messageId           Int
+  tokenAddress        String
+  mode                PanelMode
+  tokenData           String    // JSON as string
+  userData            String    // JSON as string
+  actionData          String    // JSON as string
+  activeLimitOrderId   String?
+  waitingFor          String?
+  closed              Boolean   @default(false)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
 }
 
 // Модель для отслеживания торговых позиций
 model Position {
   id           String        @id @default(cuid())
-  userId       BigInt
+  userId       BigInt        // BigInt для Telegram IDs
   tokenAddress String
   entryPrice   Float // Средняя цена входа
   size         Float // Текущий размер позиции в токенах
@@ -39,6 +39,23 @@ model Position {
   updatedAt DateTime @updatedAt
 
   @@unique([userId, tokenAddress])
+}
+
+// Модель для хранения лимитных ордеров
+model Order {
+  id          String     @id @default(cuid())
+  userId      BigInt     // Telegram ID пользователя
+  type        String     // "LIMIT", "TAKE_PROFIT", "STOP_LOSS"
+  side        String     // "BUY" или "SELL"
+  tokenMint   String
+  amount      Float      // Количество в SOL или токенах
+  price       Float      // Целевая цена
+  status      String     // "PENDING", "FILLED", "CANCELLED"
+  filledPrice Float?     // Цена исполнения
+  filledAmount Float?     // Количество исполнения
+  params      String     // JSON параметры ордера
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
 }
 
 // Модель для хранения истории сделок (покупок и продаж)

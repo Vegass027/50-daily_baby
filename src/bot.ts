@@ -18,8 +18,10 @@ import { TokenDataFetcher } from './services/TokenDataFetcher';
 import { PositionTracker } from './services/PositionTracker';
 import { TPSLManager } from './services/TPSLManager';
 import { AutoRefreshService } from './services/AutoRefreshService';
+import realtimeService from './services/RealtimeService';
 import { extractSolanaAddress } from './utils/SolanaAddressValidator';
 import { PanelMode } from './types/panel';
+import { LimitOrder } from './trading/managers/ILimitOrderManager';
 import dotenv from 'dotenv';
 import bs58 from 'bs58';
 
@@ -34,6 +36,11 @@ if (!botToken || !rpcUrl) {
 }
 
 const ALLOWED_USERS = (process.env.ALLOWED_TELEGRAM_USERS || '').split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
+
+// 🧪 TESTING MODE LOGGING
+console.log('🧪 TESTING MODE ENABLED');
+console.log('📊 Database:', process.env.DATABASE_URL || 'file:./dev.db');
+console.log('👥 Allowed users:', ALLOWED_USERS);
 
 const bot = new Telegraf(botToken);
 const solanaProvider = new SolanaProvider(rpcUrl);
@@ -396,6 +403,7 @@ bot.on('text', async (ctx, next) => {
         user_data: {
           sol_balance: solBalanceSOL,
           usd_balance: usdBalance,
+          token_balance: 0, // Добавляем недостающее поле
           has_active_order: false,
         },
         action_data: {
@@ -440,6 +448,51 @@ bot.on('text', async (ctx, next) => {
     next();
   }
 });
+
+/**
+ * Обработчик исполнения лимитного ордера.
+ * Вызывается из LimitOrderManager'ов.
+ */
+async function handleLimitOrderFill(order: LimitOrder): Promise<void> {
+  console.log(`[Bot] Handling filled limit order ${order.id}...`);
+  try {
+    if (!positionTracker || !tpslManager) {
+      console.error('[Bot] PositionTracker or TPSLManager not initialized.');
+      return;
+    }
+
+    const { userId, tokenMint, orderType, takeProfitPercent, stopLossPercent } = order.params;
+    const filledPrice = order.filledPrice || order.params.price;
+    const filledAmount = order.filledAmount || order.params.amount;
+    
+    // Получаем userId из ордера
+    if (!userId) {
+      console.error('[Bot] Order missing userId:', order.id);
+      return;
+    }
+
+    console.log(`[Bot] Order filled for user ${userId}: ${order.id}`);
+
+    if (orderType === 'buy') {
+      const position = await positionTracker.recordTrade(userId, tokenMint, 'BUY', filledPrice, filledAmount);
+      console.log(`[Bot] Recorded BUY trade for position ${position.id}`);
+
+      if (takeProfitPercent || stopLossPercent) {
+        await tpslManager.createTPSLOrders(position, {
+          tpPercent: takeProfitPercent,
+          slPercent: stopLossPercent,
+        });
+        console.log(`[Bot] Created TP/SL orders for position ${position.id}`);
+      }
+    } else { // SELL
+        // Для TP/SL ордеров, которые являются SELL, мы просто записываем сделку.
+        await positionTracker.recordTrade(userId, tokenMint, 'SELL', filledPrice, filledAmount);
+        console.log(`[Bot] Recorded SELL trade for token ${tokenMint}`);
+    }
+  } catch (error) {
+    console.error(`[Bot] Error handling filled order ${order.id}:`, error);
+  }
+}
 
 async function main() {
   try {
@@ -491,6 +544,7 @@ async function main() {
       );
       console.log('📋 Initializing PumpFun limit order manager...');
       await pumpFunLimitOrderManager.initialize();
+      pumpFunLimitOrderManager.setOrderFilledCallback(handleLimitOrderFill);
       console.log('📋 Starting PumpFun order monitoring...');
       await pumpFunLimitOrderManager.monitorOrders();
       console.log('✅ PumpFun limit order manager initialized and monitoring started.');
@@ -504,6 +558,7 @@ async function main() {
       );
       console.log('📋 Initializing Jupiter limit order manager...');
       await jupiterLimitOrderManager.initialize();
+      jupiterLimitOrderManager.setOrderFilledCallback(handleLimitOrderFill);
       console.log('📋 Starting Jupiter order monitoring...');
       await jupiterLimitOrderManager.monitorOrders();
       console.log('✅ Jupiter limit order manager initialized and monitoring started.');
@@ -522,7 +577,7 @@ async function main() {
       console.log('✅ PositionTracker initialized.');
 
       console.log('🎯 Initializing TPSLManager...');
-      tpslManager = new TPSLManager(pumpFunLimitOrderManager);
+      tpslManager = new TPSLManager(pumpFunLimitOrderManager, tokenDataFetcher);
       console.log('✅ TPSLManager initialized.');
 
       // Initialize TradingPanel without autoRefreshService first (to avoid circular dependency)
@@ -537,13 +592,18 @@ async function main() {
         tokenDataFetcher,
         positionTracker,
         tpslManager,
-        null // autoRefreshService will be set later
+        null, // autoRefreshService will be set later
+        solanaProvider
       );
       console.log('✅ Trading panel initialized.');
 
       console.log('🔄 Initializing AutoRefreshService...');
-      autoRefreshService = new AutoRefreshService(bot, stateManager!, tokenDataFetcher, tradingPanel);
+      autoRefreshService = new AutoRefreshService(bot, stateManager!, tokenDataFetcher, tradingPanel, walletManager!, solanaProvider!);
       console.log('✅ AutoRefreshService initialized.');
+      
+      // Initialize AutoRefreshService with Realtime subscriptions
+      await autoRefreshService.initialize();
+      console.log('✅ AutoRefreshService Realtime subscriptions initialized.');
       
       // Set autoRefreshService in TradingPanel via setter
       tradingPanel.setAutoRefreshService(autoRefreshService);
@@ -578,6 +638,10 @@ async function main() {
 process.once('SIGINT', async () => {
   console.log('\n🛑 Shutting down gracefully...');
   try {
+    // Отписаться от Realtime
+    await realtimeService.unsubscribeAll();
+    console.log('✅ Realtime disconnected');
+    
     if (pumpFunLimitOrderManager) {
       pumpFunLimitOrderManager.stopMonitoring();
     }
@@ -601,6 +665,10 @@ process.once('SIGINT', async () => {
 process.once('SIGTERM', async () => {
   console.log('\n🛑 Shutting down gracefully...');
   try {
+    // Отписаться от Realtime
+    await realtimeService.unsubscribeAll();
+    console.log('✅ Realtime disconnected');
+    
     if (pumpFunLimitOrderManager) {
       pumpFunLimitOrderManager.stopMonitoring();
     }

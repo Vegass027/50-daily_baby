@@ -1,26 +1,12 @@
 import { UserPanelState, TokenData, UserData, ActionData } from '../types/panel';
 import { prisma } from './PrismaClient';
-import { PanelMode } from '@prisma/client';
-
-// Helper-функция для преобразования данных из БД в тип приложения
-function dbStateToAppState(dbState: any): UserPanelState {
-  return {
-    user_id: Number(dbState.userId),
-    message_id: Number(dbState.messageId),
-    token_address: dbState.tokenAddress,
-    mode: dbState.mode.toLowerCase() as UserPanelState['mode'],
-    token_data: dbState.tokenData as unknown as TokenData,
-    user_data: dbState.userData as unknown as UserData,
-    action_data: dbState.actionData as unknown as ActionData,
-    created_at: dbState.createdAt.getTime(),
-    closed: dbState.closed,
-    waiting_for: dbState.waitingFor,
-  };
-}
+import { PanelMode, UserPanelState as PrismaUserPanelState } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 
 /**
  * Управляет состоянием торговых панелей для каждого пользователя.
  * Хранит данные в базе данных SQLite через Prisma.
+ * Обеспечивает типобезопасность и эффективные атомарные обновления.
  */
 export class StateManager {
   private readonly CACHE_TTL: number = 3600000; // 1 час
@@ -29,115 +15,148 @@ export class StateManager {
     setInterval(() => this.cleanupInactiveStates(), this.CACHE_TTL);
   }
 
-  /**
-   * Получить состояние панели для пользователя из БД.
-   */
+  private toAppState(dbState: PrismaUserPanelState): UserPanelState {
+    return {
+      // Note: userId converted from BigInt to number
+      // Safe for Telegram user IDs (< Number.MAX_SAFE_INTEGER = 9,007,199,254,740,991)
+      user_id: Number(dbState.userId), // PostgreSQL хранит как BigInt
+      message_id: Number(dbState.messageId),
+      token_address: dbState.tokenAddress,
+      mode: dbState.mode.toLowerCase() as UserPanelState['mode'],
+      token_data: JSON.parse(dbState.tokenData) as TokenData,
+      user_data: JSON.parse(dbState.userData) as UserData,
+      action_data: JSON.parse(dbState.actionData) as ActionData,
+      activeLimitOrderId: dbState.activeLimitOrderId || undefined,
+      created_at: dbState.createdAt.getTime(),
+      closed: dbState.closed,
+      waiting_for: dbState.waitingFor as UserPanelState['waiting_for'],
+    };
+  }
+
+  private toPrismaJson(value: unknown): Prisma.JsonValue {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    if (Array.isArray(value)) {
+      return value.map(item => this.toPrismaJson(item));
+    }
+    if (typeof value === 'object' && value !== null) {
+      return Object.fromEntries(
+        Object.entries(value).map(([key, val]) => [key, this.toPrismaJson(val)])
+      );
+    }
+    return value as Prisma.JsonValue;
+  }
+
+  private toDbData(state: UserPanelState): Prisma.UserPanelStateCreateInput {
+    return {
+      userId: BigInt(state.user_id), // ИЗМЕНЕНО: конвертируем number -> BigInt
+      messageId: state.message_id,
+      tokenAddress: state.token_address,
+      mode: state.mode.toUpperCase() as PanelMode,
+      tokenData: JSON.stringify(state.token_data),
+      userData: JSON.stringify(state.user_data),
+      actionData: JSON.stringify(state.action_data),
+      activeLimitOrderId: state.activeLimitOrderId || null,
+      createdAt: new Date(state.created_at),
+      closed: state.closed,
+      waitingFor: state.waiting_for || null,
+    };
+  }
+
   async getState(userId: number): Promise<UserPanelState | null> {
-    const state = await prisma.userPanelState.findUnique({
-      where: { userId: BigInt(userId) },
+    const dbState = await prisma.userPanelState.findUnique({
+      where: { userId: BigInt(userId) }, // ИЗМЕНЕНО: конвертируем в BigInt
     });
 
-    if (state && !state.closed) {
-      return dbStateToAppState(state);
+    if (dbState && !dbState.closed) {
+      return this.toAppState(dbState);
     }
     return null;
   }
-  
-  /**
-   * Установить или обновить состояние панели для пользователя в БД.
-   */
+
   async setState(userId: number, state: UserPanelState): Promise<void> {
-    const { user_id, message_id, token_data, user_data, action_data, created_at, mode, ...rest } = state;
+    try {
+      const dataForDb = this.toDbData(state);
+      const { userId: _, createdAt: __, ...updatePayload } = dataForDb;
 
-    const dataForDb = {
-      ...rest,
-      userId: BigInt(user_id),
-      messageId: BigInt(message_id),
-      mode: mode.toUpperCase() as PanelMode,
-      tokenData: token_data as any,
-      userData: user_data as any,
-      actionData: action_data as any,
-      createdAt: new Date(created_at),
-    };
-
-    await prisma.userPanelState.upsert({
-      where: { userId: BigInt(userId) },
-      update: dataForDb,
-      create: dataForDb,
-    });
+      await prisma.userPanelState.upsert({
+        where: { userId: BigInt(userId) }, // ИЗМЕНЕНО: конвертируем в BigInt
+        update: updatePayload,
+        create: {
+          ...dataForDb,
+          userId: BigInt(userId), // ИЗМЕНЕНО
+        },
+      });
+    } catch (error) {
+      console.error(`[StateManager] Error setting state for user ${userId}:`, error);
+      throw error;
+    }
   }
 
-  /**
-   * Удалить состояние панели для пользователя из БД.
-   */
   async deleteState(userId: number): Promise<void> {
     try {
-      await prisma.userPanelState.delete({ where: { userId: BigInt(userId) } });
+      await prisma.userPanelState.delete({ where: { userId: BigInt(userId) } }); // ИЗМЕНЕНО
     } catch (error: any) {
-      // Игнорируем ошибку, если запись не найдена (уже удалена)
-      if (error.code !== 'P2025') {
+      if (error.code !== 'P2025') { // 'P2025' is Prisma's code for "record not found"
         throw error;
       }
     }
   }
 
-  /**
-   * Обновить данные токена в состоянии.
-   */
-  async updateTokenData(userId: number, data: Partial<TokenData>): Promise<void> {
-    const state = await this.getState(userId);
-    if (state) {
-      const updatedState = { ...state, token_data: { ...state.token_data, ...data } };
-      await this.setState(userId, updatedState);
-    }
-  }
-
-  /**
-   * Обновить данные пользователя в состоянии.
-   */
-  async updateUserData(userId: number, data: Partial<UserData>): Promise<void> {
-    const state = await this.getState(userId);
-    if (state) {
-      const updatedState = { ...state, user_data: { ...state.user_data, ...data } };
-      await this.setState(userId, updatedState);
-    }
-  }
-
-  /**
-   * Обновить данные действия в состоянии.
-   */
-  async updateActionData(userId: number, data: Partial<ActionData>): Promise<void> {
-    const state = await this.getState(userId);
-    if (state) {
-      const updatedState = { ...state, action_data: { ...state.action_data, ...data } };
-      await this.setState(userId, updatedState);
-    }
-  }
-
-  /**
-   * Очищает неактивные (старше 1 часа) состояния панелей из БД.
-   */
-  async cleanupInactiveStates(): Promise<void> {
-    const oneHourAgo = new Date(Date.now() - this.CACHE_TTL);
-    const result = await prisma.userPanelState.deleteMany({
-      where: {
-        createdAt: {
-          lt: oneHourAgo,
-        },
-      },
+  private async updateJsonField<T>(userId: number, field: 'tokenData' | 'userData' | 'actionData', data: Partial<T>): Promise<void> {
+    const currentState = await prisma.userPanelState.findUnique({
+      where: { userId: BigInt(userId) }, // ИЗМЕНЕНО
+      select: { [field]: true },
     });
-    if (result.count > 0) {
-      console.log(`[StateManager] Cleaned up ${result.count} inactive states from DB.`);
+
+    if (currentState) {
+      const currentJson = JSON.parse(currentState[field] as string) || {};
+      const newJson = { ...currentJson, ...data };
+
+      await prisma.userPanelState.update({
+        where: { userId: BigInt(userId) }, // ИЗМЕНЕНО
+        data: { [field]: JSON.stringify(newJson) },
+      });
     }
   }
 
-  /**
-   * Получить все активные состояния из БД.
-   */
+  async updateTokenData(userId: number, data: Partial<TokenData>): Promise<void> {
+    await this.updateJsonField<TokenData>(userId, 'tokenData', data);
+  }
+
+  async updateUserData(userId: number, data: Partial<UserData>): Promise<void> {
+    await this.updateJsonField<UserData>(userId, 'userData', data);
+  }
+
+  async updateActionData(userId: number, data: Partial<ActionData>): Promise<void> {
+    await this.updateJsonField<ActionData>(userId, 'actionData', data);
+  }
+
+  async cleanupInactiveStates(): Promise<void> {
+    try {
+      const oneHourAgo = new Date(Date.now() - this.CACHE_TTL);
+      
+      // Удаляем все старые состояния (и closed, и открытые)
+      const result = await prisma.userPanelState.deleteMany({
+        where: {
+          createdAt: { lt: oneHourAgo },
+          // Убираем фильтр closed: true - удаляем все старые состояния
+        },
+      });
+      
+      if (result.count > 0) {
+        console.log(`[StateManager] Cleaned up ${result.count} inactive states from DB.`);
+      }
+    } catch (error) {
+      console.error(`[StateManager] Error during cleanup:`, error);
+    }
+  }
+
   async getAllStates(): Promise<UserPanelState[]> {
     const dbStates = await prisma.userPanelState.findMany({
       where: { closed: false },
     });
-    return dbStates.map(dbStateToAppState);
+    return dbStates.map(this.toAppState);
   }
 }

@@ -1,15 +1,20 @@
 import { PrismaClient } from '@prisma/client';
-import { PrismaBetterSqlite3 } from '@prisma/adapter-better-sqlite3';
+import { PrismaPg } from '@prisma/adapter-pg';
 
-// Создаем адаптер для SQLite
-const adapter = new PrismaBetterSqlite3({
-  url: process.env.DATABASE_URL || 'file:./prisma/dev.db',
+// Создаем адаптер для PostgreSQL
+const adapter = new PrismaPg({
+  connectionString: process.env.DATABASE_URL,
 });
 
 // Создаем единый экземпляр PrismaClient для всего приложения с условным логированием
 export const prisma = new PrismaClient({
+  adapter,
   log: process.env.NODE_ENV === 'production'
     ? ['warn', 'error']
     : ['query', 'info', 'warn', 'error'],
-  adapter,
+});
+
+// Graceful shutdown
+process.on('beforeExit', async () => {
+  await prisma.$disconnect();
 });

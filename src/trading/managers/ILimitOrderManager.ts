@@ -17,6 +17,7 @@ export enum OrderStatus {
 }
 
 export interface LimitOrderParams {
+  userId: number; // ID пользователя, создающего ордер
   tokenMint: string;
   orderType: OrderType;
   amount: number; // в базовых единицах (lamports для SOL, token units для токенов)
@@ -39,9 +40,17 @@ export interface LimitOrder {
   errorMessage?: string; // текст ошибки при статусе ERROR
 }
 
+export type OrderFilledCallback = (order: LimitOrder) => Promise<void>;
+
 export interface ILimitOrderManager {
   name: string;
   dex: string;
+
+  /**
+   * Установить колбэк, который будет вызываться при исполнении ордера.
+   * @param callback Функция обратного вызова
+   */
+  setOrderFilledCallback(callback: OrderFilledCallback): void;
 
   /**
    * Создать лимитный ордер

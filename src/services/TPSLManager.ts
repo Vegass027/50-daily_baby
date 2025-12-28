@@ -1,73 +1,122 @@
 import { ILimitOrderManager, LimitOrderParams, OrderType } from '../trading/managers/ILimitOrderManager';
 import { prisma } from './PrismaClient';
+import { Position } from '@prisma/client';
+import { TokenDataFetcher } from './TokenDataFetcher';
+
+interface TPSLParams {
+  tpPercent?: number;
+  slPercent?: number;
+  tpPrice?: number;
+  slPrice?: number;
+}
 
 /**
- * Менеджер Take Profit / Stop Loss ордеров с хранением в БД.
+ * Менеджер Take Profit / Stop Loss ордеров.
+ * Инкапсулирует логику создания, отмены и отслеживания TP/SL ордеров.
  */
 export class TPSLManager {
   private limitOrderManager: ILimitOrderManager;
+  private tokenDataFetcher?: TokenDataFetcher;
+  private orderLocks: Map<string, Promise<void>> = new Map();
 
-  constructor(limitOrderManager: ILimitOrderManager) {
+  constructor(limitOrderManager: ILimitOrderManager, tokenDataFetcher?: TokenDataFetcher) {
     this.limitOrderManager = limitOrderManager;
-    console.log('[TPSLManager] Initialized with database backend.');
+    this.tokenDataFetcher = tokenDataFetcher;
+    console.log('[TPSLManager] Initialized.');
   }
-
+  
   /**
-   * Создает TP/SL ордера и сохраняет связь с позицией в БД.
+   * Создает TP/SL ордера для указанной позиции в рамках одной транзакции.
    */
   async createTPSLOrders(
-    positionId: string,
-    tokenAddress: string,
-    entryPrice: number,
-    size: number,
-    tpPercent?: number,
-    slPercent?: number
+    position: Position,
+    params: TPSLParams
   ): Promise<{ tpOrderId?: string; slOrderId?: string }> {
-    let tpOrderId: string | undefined;
-    let slOrderId: string | undefined;
+    const { tpPercent, slPercent, tpPrice: fixedTpPrice, slPrice: fixedSlPrice } = params;
+    const { id: positionId, tokenAddress, entryPrice, size, userId } = position;
 
-    try {
-      if (tpPercent && tpPercent > 0) {
-        const tpPrice = entryPrice * (1 + tpPercent / 100);
-        tpOrderId = await this.createSellOrder(tokenAddress, tpPrice, size, 1.0);
+    if (size <= 0) {
+      throw new Error('Cannot create TP/SL for a closed position.');
+    }
+
+    const tpPrice = fixedTpPrice || (tpPercent && tpPercent > 0 ? entryPrice * (1 + tpPercent / 100) : undefined);
+    const slPrice = fixedSlPrice || (slPercent && slPercent > 0 ? entryPrice * (1 - slPercent / 100) : undefined);
+
+    if (!tpPrice && !slPrice) {
+      return {};
+    }
+
+    // Получить decimals токена
+    let decimals = 9; // По умолчанию
+    if (this.tokenDataFetcher) {
+      try {
+        const tokenData = await this.tokenDataFetcher.fetchTokenData(tokenAddress);
+        decimals = tokenData?.decimals || 9;
+      } catch (error) {
+        console.warn(`[TPSLManager] Could not fetch token data for ${tokenAddress}, using default decimals: ${decimals}`);
       }
+    }
 
-      if (slPercent && slPercent > 0) {
-        const slPrice = entryPrice * (1 - slPercent / 100);
-        slOrderId = await this.createSellOrder(tokenAddress, slPrice, size, 2.0);
-      }
+    return prisma.$transaction(async (tx) => {
+      let tpOrderId: string | undefined;
+      let slOrderId: string | undefined;
 
-      if (tpOrderId || slOrderId) {
-        await prisma.linkedOrder.create({
+      try {
+        if (tpPrice) {
+          tpOrderId = await this.createSellOrder(tokenAddress, tpPrice, size, decimals, Number(userId));
+        }
+        if (slPrice) {
+          slOrderId = await this.createSellOrder(tokenAddress, slPrice, size, decimals, Number(userId));
+        }
+        
+        // Удаляем старую связку, если она есть, и создаем новую
+        await tx.linkedOrder.deleteMany({ where: { positionId } });
+        await tx.linkedOrder.create({
           data: {
-            positionId: positionId,
-            tpOrderId: tpOrderId,
-            slOrderId: slOrderId,
-            orderType: this.limitOrderManager.constructor.name, // 'PumpFunLimitOrderManager' или 'JupiterLimitOrderManager'
+            positionId,
+            tpOrderId,
+            slOrderId,
+            orderType: this.limitOrderManager.constructor.name,
           },
         });
-        console.log(`[TPSLManager] Created and linked TP/SL orders for position ${positionId}.`);
-      }
 
-      return { tpOrderId, slOrderId };
-    } catch (error) {
-      console.error(`[TPSLManager] Error creating TP/SL orders for position ${positionId}:`, error);
-      // Откатываем созданные ордера в случае ошибки
-      if (tpOrderId) await this.limitOrderManager.cancelOrder(tpOrderId).catch(e => console.error(`[TPSLManager] Rollback failed for TP order ${tpOrderId}`, e));
-      if (slOrderId) await this.limitOrderManager.cancelOrder(slOrderId).catch(e => console.error(`[TPSLManager] Rollback failed for SL order ${slOrderId}`, e));
-      throw error;
-    }
+        console.log(`[TPSLManager] Created and linked TP/SL orders for position ${positionId}.`);
+        return { tpOrderId, slOrderId };
+
+      } catch (error) {
+        // Транзакция автоматически откатит создание записей в БД.
+        // Нужно вручную откатить созданные в блокчейне ордера.
+        console.error(`[TPSLManager] Error in transaction for position ${positionId}. Rolling back blockchain orders...`, error);
+        if (tpOrderId) await this.limitOrderManager.cancelOrder(tpOrderId).catch(e => console.error(`[TPSLManager] Rollback failed for TP order ${tpOrderId}`, e));
+        if (slOrderId) await this.limitOrderManager.cancelOrder(slOrderId).catch(e => console.error(`[TPSLManager] Rollback failed for SL order ${slOrderId}`, e));
+        throw new Error('Failed to create TP/SL orders.');
+      }
+    });
   }
 
-  private async createSellOrder(tokenAddress: string, price: number, size: number, slippage: number): Promise<string> {
+  private async createSellOrder(
+    tokenAddress: string,
+    price: number,
+    size: number,
+    decimals: number,
+    userId: number
+  ): Promise<string> {
+    // Конвертировать размер из токенов в базовые единицы
+    const amountInBaseUnits = Math.floor(size * Math.pow(10, decimals));
+    
+    // price должна быть в SOL per token (например, 0.00001234)
+    // LimitOrderManager сам конвертирует в lamports если нужно
+    
     const params: LimitOrderParams = {
+      userId: userId,
       tokenMint: tokenAddress,
       orderType: OrderType.SELL,
-      amount: size,
+      amount: amountInBaseUnits, // В базовых единицах
       price: price,
-      slippage: slippage,
+      slippage: 1.0, // Стандартное проскальзывание для TP/SL
     };
-    return await this.limitOrderManager.createOrder(params);
+    
+    return this.limitOrderManager.createOrder(params);
   }
 
   /**
@@ -78,20 +127,16 @@ export class TPSLManager {
       where: { positionId },
     });
 
-    if (!linkedOrder) {
-      return;
-    }
+    if (!linkedOrder) return;
 
+    const { tpOrderId, slOrderId } = linkedOrder;
     const cancelPromises: Promise<void>[] = [];
-    if (linkedOrder.tpOrderId) {
-      cancelPromises.push(this.limitOrderManager.cancelOrder(linkedOrder.tpOrderId));
-    }
-    if (linkedOrder.slOrderId) {
-      cancelPromises.push(this.limitOrderManager.cancelOrder(linkedOrder.slOrderId));
-    }
 
-    await Promise.all(cancelPromises.map(p => p.catch(e => console.error('[TPSLManager] Error during bulk cancel:', e))));
+    if (tpOrderId) cancelPromises.push(this.limitOrderManager.cancelOrder(tpOrderId));
+    if (slOrderId) cancelPromises.push(this.limitOrderManager.cancelOrder(slOrderId));
 
+    await Promise.allSettled(cancelPromises);
+    
     await prisma.linkedOrder.delete({ where: { positionId } });
     console.log(`[TPSLManager] Cancelled all related orders for position ${positionId}`);
   }
@@ -99,21 +144,31 @@ export class TPSLManager {
   /**
    * Обрабатывает исполнение одного из связанных ордеров (TP или SL).
    * Находит и отменяет противоположный ордер.
+   * Защищено от race condition при одновременном исполнении TP и SL.
    */
   async onOrderFilled(filledOrderId: string): Promise<void> {
-    const linkedOrder = await prisma.linkedOrder.findFirst({
-      where: {
-        OR: [
-          { tpOrderId: filledOrderId },
-          { slOrderId: filledOrderId },
-        ],
-      },
-    });
-
-    if (!linkedOrder) {
-      // Ордер не является частью TP/SL связки
+    // Проверить, не обрабатывается ли уже этот ордер
+    if (this.orderLocks.has(filledOrderId)) {
+      await this.orderLocks.get(filledOrderId);
       return;
     }
+    
+    const processingPromise = this.processOrderFilled(filledOrderId);
+    this.orderLocks.set(filledOrderId, processingPromise);
+    
+    try {
+      await processingPromise;
+    } finally {
+      this.orderLocks.delete(filledOrderId);
+    }
+  }
+
+  private async processOrderFilled(filledOrderId: string): Promise<void> {
+    const linkedOrder = await prisma.linkedOrder.findFirst({
+      where: { OR: [{ tpOrderId: filledOrderId }, { slOrderId: filledOrderId }] },
+    });
+
+    if (!linkedOrder) return; // Ордер не является частью TP/SL связки
 
     const isTP = linkedOrder.tpOrderId === filledOrderId;
     const oppositeOrderId = isTP ? linkedOrder.slOrderId : linkedOrder.tpOrderId;
@@ -127,7 +182,6 @@ export class TPSLManager {
       }
     }
 
-    // Удаляем связку из БД, так как позиция закрыта
     await prisma.linkedOrder.delete({ where: { id: linkedOrder.id } });
   }
 
@@ -135,9 +189,7 @@ export class TPSLManager {
    * Проверяет, есть ли у позиции активные TP/SL ордера.
    */
   async hasActiveOrders(positionId: string): Promise<boolean> {
-    const count = await prisma.linkedOrder.count({
-        where: { positionId }
-    });
+    const count = await prisma.linkedOrder.count({ where: { positionId } });
     return count > 0;
   }
 }
