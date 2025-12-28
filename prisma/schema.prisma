@@ -9,6 +9,15 @@ datasource db {
   provider = "postgresql"
 }
 
+// Модель для хранения зашифрованного кошелька
+model Wallet {
+  id              String   @id @default(cuid())
+  publicKey       String   @unique
+  encryptedKey    String   // Зашифрованный приватный ключ
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
 // Модель для хранения состояния торговой панели пользователя
 model UserPanelState {
   userId              BigInt    @id  // BigInt для Telegram IDs

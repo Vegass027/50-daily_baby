@@ -1,15 +1,13 @@
 import { Keypair, Connection, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
 import * as crypto from 'crypto';
-import * as fs from 'fs/promises';
-import * as path from 'path';
 import dotenv from 'dotenv';
 import bs58 from 'bs58';
+import { prisma } from '../services/PrismaClient';
 
 dotenv.config();
 
 const ALGORITHM = 'aes-256-cbc';
 const IV_LENGTH = 16;
-const WALLET_FILE = path.resolve(__dirname, '../../wallet.json');
 
 // Класс для безопасного хранения, отвечающий за шифрование и дешифрование
 class SecureWalletStorage {
@@ -17,7 +15,7 @@ class SecureWalletStorage {
 
     constructor() {
         if (!this.masterPassword) {
-            throw new Error('MASTER_PASSWORD is not set in the .env file.');
+            throw new Error('MASTER_PASSWORD is not set in .env file.');
         }
     }
 
@@ -54,23 +52,44 @@ export class WalletManager {
         this.connection = new Connection(rpcUrl, 'confirmed');
     }
 
-    private async saveWalletToFile(publicKey: PublicKey, encryptedPrivateKey: string): Promise<void> {
-        const data = {
-            publicKey: publicKey.toBase58(),
-            encryptedPrivateKey: encryptedPrivateKey,
-        };
-        await fs.writeFile(WALLET_FILE, JSON.stringify(data, null, 2));
+    private async saveWalletToDB(publicKey: PublicKey, encryptedPrivateKey: string): Promise<void> {
+        const publicKeyStr = publicKey.toBase58();
+        
+        // Проверяем, существует ли кошелек
+        const existingWallet = await prisma.wallet.findUnique({
+            where: { publicKey: publicKeyStr }
+        });
+
+        if (existingWallet) {
+            // Обновляем существующий кошелек
+            await prisma.wallet.update({
+                where: { publicKey: publicKeyStr },
+                data: { encryptedKey: encryptedPrivateKey }
+            });
+        } else {
+            // Создаем новый кошелек
+            await prisma.wallet.create({
+                data: {
+                    publicKey: publicKeyStr,
+                    encryptedKey: encryptedPrivateKey
+                }
+            });
+        }
     }
 
-    private async loadWalletData(): Promise<{ publicKey: string; encryptedPrivateKey: string } | null> {
+    private async loadWalletFromDB(): Promise<{ publicKey: string; encryptedPrivateKey: string } | null> {
         try {
-            const data = await fs.readFile(WALLET_FILE, 'utf-8');
-            return JSON.parse(data);
-        } catch (error: any) {
-            if (error.code === 'ENOENT') {
-                return null; // Файл не найден
+            const wallet = await prisma.wallet.findFirst();
+            if (!wallet) {
+                return null;
             }
-            throw error; // Другая ошибка чтения
+            return {
+                publicKey: wallet.publicKey,
+                encryptedPrivateKey: wallet.encryptedKey
+            };
+        } catch (error) {
+            console.error('Error loading wallet from database:', error);
+            return null;
         }
     }
     
@@ -79,7 +98,7 @@ export class WalletManager {
         const privateKeyBs58 = bs58.encode(keypair.secretKey);
         const encryptedPrivateKey = this.storage.encrypt(privateKeyBs58);
         
-        await this.saveWalletToFile(keypair.publicKey, encryptedPrivateKey);
+        await this.saveWalletToDB(keypair.publicKey, encryptedPrivateKey);
         
         return keypair.publicKey;
     }
@@ -89,13 +108,13 @@ export class WalletManager {
         const keypair = Keypair.fromSecretKey(secretKey);
         const encryptedPrivateKey = this.storage.encrypt(privateKeyBs58);
         
-        await this.saveWalletToFile(keypair.publicKey, encryptedPrivateKey);
+        await this.saveWalletToDB(keypair.publicKey, encryptedPrivateKey);
 
         return keypair.publicKey;
     }
 
     async getWallet(): Promise<Keypair | null> {
-        const walletData = await this.loadWalletData();
+        const walletData = await this.loadWalletFromDB();
         if (!walletData) {
             return null;
         }
