@@ -30,17 +30,18 @@ dotenv.config();
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
 const rpcUrl = process.env.ALCHEMY_SOLANA_RPC || process.env.QUICKNODE_RPC_URL;
 
-if (!botToken || !rpcUrl) {
-  console.error('TELEGRAM_BOT_TOKEN and a RPC_URL (ALCHEMY_SOLANA_RPC or QUICKNODE_RPC_URL) must be provided!');
-  process.exit(1);
-}
-
 const ALLOWED_USERS = (process.env.ALLOWED_TELEGRAM_USERS || '').split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id));
 
 // 🧪 TESTING MODE LOGGING
 console.log('🧪 TESTING MODE ENABLED');
 console.log('📊 Database:', process.env.DATABASE_URL || 'file:./dev.db');
 console.log('👥 Allowed users:', ALLOWED_USERS);
+console.log('📡 RPC URL:', rpcUrl ? `${rpcUrl.substring(0, 20)}...` : 'NOT SET');
+
+if (!botToken || !rpcUrl) {
+  console.error('TELEGRAM_BOT_TOKEN and a RPC_URL (ALCHEMY_SOLANA_RPC or QUICKNODE_RPC_URL) must be provided!');
+  process.exit(1);
+}
 
 const bot = new Telegraf(botToken);
 const solanaProvider = new SolanaProvider(rpcUrl);
